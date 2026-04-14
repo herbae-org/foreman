@@ -1,0 +1,47 @@
+# .github/workflows/test-autoagent-config.yml
+# Smoke-test: runs the autoagent-config loader test harness on ubuntu-latest to
+# prove the loader works end-to-end in the CI environment the real agents will
+# use.
+#
+# Why this doesn't invoke ./.github/actions/autoagent-setup directly: that
+# composite action sources the loader against the shipped autoagent-config.yml,
+# which carries `your-org` placeholder values. The loader's CI guard refuses
+# placeholders. Running the test harness (which uses a synthetic config with
+# real-looking values) is the right contract check at this stage; the composite
+# action gets exercised once Tasks 3/4 wire real values into downstream
+# workflows.
+
+name: Test autoagent-config
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/autoagent-config.yml'
+      - '.github/scripts/autoagent-config.sh'
+      - '.github/scripts/test-autoagent-config.sh'
+      - '.github/actions/autoagent-setup/**'
+      - '.github/workflows/test-autoagent-config.yml'
+  pull_request:
+    paths:
+      - '.github/autoagent-config.yml'
+      - '.github/scripts/autoagent-config.sh'
+      - '.github/scripts/test-autoagent-config.sh'
+      - '.github/actions/autoagent-setup/**'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.44.3
+
+      - name: Show yq version
+        run: yq --version
+
+      - name: Run loader test harness
+        run: bash .github/scripts/test-autoagent-config.sh
