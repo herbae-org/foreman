@@ -290,12 +290,13 @@ jobs:
   notify-start:
     needs: prepare
     if: needs.prepare.outputs.skip != 'true'
-    uses: ./.github/workflows/telegram.yml
+    uses: ./.github/workflows/notify.yml
     with:
       message: ${{ needs.prepare.outputs.start_message }}
     secrets:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
   implement:
     needs: prepare
@@ -427,9 +428,10 @@ jobs:
   notify-done:
     needs: implement
     if: always() && needs.implement.outputs.after_message != ''
-    uses: ./.github/workflows/telegram.yml
+    uses: ./.github/workflows/notify.yml
     with:
       message: ${{ needs.implement.outputs.after_message }}
     secrets:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

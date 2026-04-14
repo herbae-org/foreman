@@ -24,6 +24,11 @@ jobs:
     timeout-minutes: 5
 
     steps:
+      - uses: actions/checkout@v4
+        with: {sparse-checkout: .github, sparse-checkout-cone-mode: false}
+
+      - uses: ./.github/actions/autoagent-setup
+
       - name: Extract issue number from branch
         id: issue
         run: |
@@ -105,13 +110,37 @@ jobs:
 
           echo "#${ISSUE_NUM} → READY FOR QA"
 
-          # Notify via Telegram
+          # Notify via configured provider
           PR_URL="${{ github.event.pull_request.html_url }}"
           PR_TITLE="${{ github.event.pull_request.title }}"
-          TELEGRAM_MSG="PR ready for QA: #${ISSUE_NUM}%0A${PR_TITLE}%0A${PR_URL}"
-          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d "text=${TELEGRAM_MSG}" > /dev/null 2>&1 || true
+          NOTIFY_MSG="PR ready for QA: #${ISSUE_NUM}
+${PR_TITLE}
+${PR_URL}"
+          case "${AUTOAGENT_NOTIFY_PROVIDER:-none}" in
+            telegram)
+              BOT="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+              CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+              if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+                echo "notify: telegram secrets missing — skipping"
+              else
+                curl -sS -X POST "https://api.telegram.org/bot${BOT}/sendMessage" \
+                  --data-urlencode "chat_id=${CHAT}" \
+                  --data-urlencode "text=${NOTIFY_MSG}" >/dev/null 2>&1 || true
+              fi
+              ;;
+            slack)
+              WEBHOOK="${{ secrets.SLACK_WEBHOOK_URL }}"
+              if [ -z "$WEBHOOK" ]; then
+                echo "notify: slack webhook missing — skipping"
+              else
+                jq -n --arg t "$NOTIFY_MSG" '{text:$t}' | \
+                  curl -sS -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK" >/dev/null 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "notify: provider=${AUTOAGENT_NOTIFY_PROVIDER:-none}, skipping"
+              ;;
+          esac
         env:
           GH_TOKEN: ${{ secrets.AGENT_PAT }}
 
@@ -136,11 +165,33 @@ jobs:
 
           echo "#${ISSUE_NUM} → DONE"
 
-          # Notify via Telegram
-          TELEGRAM_MSG="Merged and done: #${ISSUE_NUM}  - ${{ github.event.pull_request.title }}"
-          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d "text=${TELEGRAM_MSG}" > /dev/null 2>&1 || true
+          # Notify via configured provider
+          NOTIFY_MSG="Merged and done: #${ISSUE_NUM} - ${{ github.event.pull_request.title }}"
+          case "${AUTOAGENT_NOTIFY_PROVIDER:-none}" in
+            telegram)
+              BOT="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+              CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+              if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+                echo "notify: telegram secrets missing — skipping"
+              else
+                curl -sS -X POST "https://api.telegram.org/bot${BOT}/sendMessage" \
+                  --data-urlencode "chat_id=${CHAT}" \
+                  --data-urlencode "text=${NOTIFY_MSG}" >/dev/null 2>&1 || true
+              fi
+              ;;
+            slack)
+              WEBHOOK="${{ secrets.SLACK_WEBHOOK_URL }}"
+              if [ -z "$WEBHOOK" ]; then
+                echo "notify: slack webhook missing — skipping"
+              else
+                jq -n --arg t "$NOTIFY_MSG" '{text:$t}' | \
+                  curl -sS -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK" >/dev/null 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "notify: provider=${AUTOAGENT_NOTIFY_PROVIDER:-none}, skipping"
+              ;;
+          esac
         env:
           GH_TOKEN: ${{ secrets.AGENT_PAT }}
 
@@ -180,10 +231,32 @@ jobs:
 
           echo "#${ISSUE_NUM} → TODO"
 
-          # Notify via Telegram
-          TELEGRAM_MSG="PR closed without merge: #${ISSUE_NUM}  - back to TODO"
-          curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d "text=${TELEGRAM_MSG}" > /dev/null 2>&1 || true
+          # Notify via configured provider
+          NOTIFY_MSG="PR closed without merge: #${ISSUE_NUM} - back to TODO"
+          case "${AUTOAGENT_NOTIFY_PROVIDER:-none}" in
+            telegram)
+              BOT="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+              CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+              if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+                echo "notify: telegram secrets missing — skipping"
+              else
+                curl -sS -X POST "https://api.telegram.org/bot${BOT}/sendMessage" \
+                  --data-urlencode "chat_id=${CHAT}" \
+                  --data-urlencode "text=${NOTIFY_MSG}" >/dev/null 2>&1 || true
+              fi
+              ;;
+            slack)
+              WEBHOOK="${{ secrets.SLACK_WEBHOOK_URL }}"
+              if [ -z "$WEBHOOK" ]; then
+                echo "notify: slack webhook missing — skipping"
+              else
+                jq -n --arg t "$NOTIFY_MSG" '{text:$t}' | \
+                  curl -sS -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK" >/dev/null 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "notify: provider=${AUTOAGENT_NOTIFY_PROVIDER:-none}, skipping"
+              ;;
+          esac
         env:
           GH_TOKEN: ${{ secrets.AGENT_PAT }}

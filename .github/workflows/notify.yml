@@ -1,0 +1,55 @@
+# .github/workflows/notify.yml
+# Reusable workflow that dispatches a notification to the configured provider.
+# Called via: uses: ./.github/workflows/notify.yml
+
+name: Notify
+
+on:
+  workflow_call:
+    inputs:
+      message:
+        required: true
+        type: string
+    secrets:
+      TELEGRAM_BOT_TOKEN: {required: false}
+      TELEGRAM_CHAT_ID:   {required: false}
+      SLACK_WEBHOOK_URL:  {required: false}
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with: {sparse-checkout: .github, sparse-checkout-cone-mode: false}
+
+      - uses: ./.github/actions/autoagent-setup
+
+      - name: Send (telegram)
+        if: env.AUTOAGENT_NOTIFY_PROVIDER == 'telegram'
+        env:
+          MESSAGE: ${{ inputs.message }}
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+            echo "notify: telegram secrets missing — skipping"; exit 0
+          fi
+          curl -sS -X POST "https://api.telegram.org/bot${BOT}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT}" \
+            --data-urlencode "text=${MESSAGE}" >/dev/null
+
+      - name: Send (slack)
+        if: env.AUTOAGENT_NOTIFY_PROVIDER == 'slack'
+        env:
+          MESSAGE: ${{ inputs.message }}
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "notify: slack webhook missing — skipping"; exit 0
+          fi
+          jq -n --arg t "$MESSAGE" '{text:$t}' | curl -sS -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK" >/dev/null
+
+      - name: Skip (none)
+        if: env.AUTOAGENT_NOTIFY_PROVIDER == 'none'
+        run: echo "notify: provider=none, skipping"

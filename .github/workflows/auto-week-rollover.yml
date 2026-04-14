@@ -322,9 +322,10 @@ jobs:
   notify:
     needs: rollover
     if: needs.rollover.outputs.telegram_message != ''
-    uses: ./.github/workflows/telegram.yml
+    uses: ./.github/workflows/notify.yml
     with:
       message: ${{ needs.rollover.outputs.telegram_message }}
     secrets:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
