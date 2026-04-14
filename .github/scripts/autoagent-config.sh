@@ -69,6 +69,36 @@ export AUTOAGENT_NOTIFY_PROVIDER="$(_cfg '.notifications.provider')"
 # Runner
 export AUTOAGENT_RUNNER_LABELS="$(_cfg '.runner.labels')"
 
+# Validation: every required key must resolve to a non-null, non-empty value.
+_required_vars=(
+  AUTOAGENT_ORG
+  AUTOAGENT_REPO
+  AUTOAGENT_PROJECT_NUMBER
+  AUTOAGENT_STATUS_FIELD
+  AUTOAGENT_COL_TODO
+  AUTOAGENT_COL_IN_PROGRESS
+  AUTOAGENT_COL_READY_FOR_QA
+  AUTOAGENT_COL_DONE
+  AUTOAGENT_LABEL_PLAN
+  AUTOAGENT_BRANCH_PREFIX
+  AUTOAGENT_NOTIFY_PROVIDER
+  AUTOAGENT_IMPLEMENTER_MODEL
+  AUTOAGENT_IMPLEMENTER_MAX_TURNS
+  AUTOAGENT_IMPLEMENTER_TEST_RETRY_BUDGET
+  AUTOAGENT_PLANNER_MODEL
+  AUTOAGENT_FIXER_MODEL
+  AUTOAGENT_MERGER_MODEL
+  AUTOAGENT_MERGER_METHOD
+)
+for _v in "${_required_vars[@]}"; do
+  _val="${!_v:-}"
+  if [ -z "$_val" ] || [ "$_val" = "null" ]; then
+    echo "autoagent-config: required key $_v is missing or null in $CONFIG_PATH" >&2
+    return 1 2>/dev/null || exit 1
+  fi
+done
+unset _v _val _required_vars
+
 # Validation: refuse placeholder strings in CI.
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
   case "$AUTOAGENT_ORG" in

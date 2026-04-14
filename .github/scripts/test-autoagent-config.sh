@@ -57,3 +57,29 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 [ "$AUTOAGENT_NOTIFY_PROVIDER" = "none" ]          || fail "provider"
 
 echo "PASS: autoagent-config.sh loaded all expected keys"
+
+# Negative test: missing required key must fail cleanly.
+BAD=$(mktemp --tmpdir="$HOME")
+cat > "$BAD" <<'YAML'
+github: {}   # organization, repository, project_number all missing
+board:
+  status_field: "Status"
+  columns: {todo: "T", in_progress: "IP", ready_for_qa: "Q", done: "D"}
+milestones: {use_iterations: false, format: "YY CW WW", iteration_field: "F", done_status: "D"}
+labels: {priorities: [], plan: "plan", high_risk: "r/h", medium_risk: "r/m", low_risk: "r/l"}
+branch: {prefix: "autoagent/"}
+severity_keywords: {blocking: ["X"]}
+agents:
+  planner: {enabled: true, model: "x", max_turns: 1, timeout_minutes: 1}
+  implementer: {enabled: true, model: "x", max_turns: 1, timeout_minutes: 1, test_retry_budget: 1}
+  fixer: {enabled: true, model: "x", max_turns: 1, timeout_minutes: 1}
+  merger: {enabled: true, model: "x", merge_method: "merge", pause_seconds: 1}
+notifications: {provider: "none", telegram: {bot_token_secret: "x", chat_id_secret: "y"}, slack: {webhook_secret: "z"}}
+runner: {labels: "ubuntu-latest"}
+YAML
+# Run in a subshell so the loader's `return 1` doesn't exit the harness.
+OUTPUT=$(AUTOAGENT_CONFIG="$BAD" bash -c 'source .github/scripts/autoagent-config.sh' 2>&1 || true)
+rm -f "$BAD"
+echo "$OUTPUT" | grep -q "AUTOAGENT_ORG is missing or null" \
+  || { echo "FAIL: negative test did not produce expected error. got:"; echo "$OUTPUT"; exit 1; }
+echo "PASS: negative test — missing required key is rejected"

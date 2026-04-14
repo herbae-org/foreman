@@ -19,4 +19,15 @@ runs:
       shell: bash
       run: |
         source .github/scripts/autoagent-config.sh
-        env | grep '^AUTOAGENT_' >> "$GITHUB_ENV"
+        # Use the delimiter form of $GITHUB_ENV so multi-line values survive.
+        while IFS='=' read -r key value; do
+          case "$key" in
+            AUTOAGENT_*)
+              {
+                printf '%s<<__AUTOAGENT_EOF__\n' "$key"
+                printf '%s\n' "$value"
+                printf '__AUTOAGENT_EOF__\n'
+              } >> "$GITHUB_ENV"
+              ;;
+          esac
+        done < <(env)
