@@ -1,6 +1,13 @@
 # .github/workflows/notify.yml
 # Reusable workflow that dispatches a notification to the configured provider.
 # Called via: uses: ./.github/workflows/notify.yml
+#
+# Error-handling contract: missing secrets degrade to a log line (exit 0), but
+# actual delivery errors (e.g. non-2xx HTTP responses from the provider) propagate
+# and fail the job. This is deliberate — it surfaces broken notify configs in CI.
+# Callers that must never fail on notify issues (e.g. `autoagent-board-sync.yml`)
+# handle provider switching inline with their own soft-fail (`|| true`) rather than
+# calling this workflow.
 
 name: Notify
 
@@ -53,3 +60,7 @@ jobs:
       - name: Skip (none)
         if: env.AUTOAGENT_NOTIFY_PROVIDER == 'none'
         run: echo "notify: provider=none, skipping"
+
+      - name: Skip (unknown/empty)
+        if: env.AUTOAGENT_NOTIFY_PROVIDER != 'telegram' && env.AUTOAGENT_NOTIFY_PROVIDER != 'slack' && env.AUTOAGENT_NOTIFY_PROVIDER != 'none'
+        run: echo "notify: provider='${AUTOAGENT_NOTIFY_PROVIDER:-<unset>}' unknown, skipping"
