@@ -1,19 +1,35 @@
 # .github/actions/autoagent-setup/action.yml
-# Composite action: installs yq (pinned) and sources autoagent-config.sh,
-# exporting AUTOAGENT_* env vars into the calling job.
+# Composite action: sources autoagent-config.sh and exports AUTOAGENT_* env vars
+# into the calling job.
 #
 # Usage in a job:
 #   - uses: actions/checkout@v4
 #   - uses: ./.github/actions/autoagent-setup
+#
+# yq availability: we rely on yq being preinstalled on `ubuntu-latest` runners.
+# As of writing, GitHub's ubuntu-latest images ship with yq v4.x out of the box,
+# so no install step is needed. The "Verify yq" step below fails loudly if yq
+# ever disappears from the image — at that point we'll need to reintroduce an
+# explicit install (pinned binary via `curl` or a setup action), but until then
+# skipping the install keeps the composite cheap and free of third-party deps.
 
 name: Autoagent setup
-description: Install yq and load autoagent-config.yml into the job environment.
+description: Verify yq is available and load autoagent-config.yml into the job environment.
 
 runs:
   using: composite
   steps:
-    - name: Install yq
-      uses: mikefarah/yq@v4.44.3
+    - name: Verify yq is available
+      shell: bash
+      run: |
+        if ! command -v yq >/dev/null 2>&1; then
+          echo "autoagent-setup: yq is not on PATH." >&2
+          echo "This action relies on yq being preinstalled on the runner." >&2
+          echo "If you're seeing this, the runner image no longer ships yq and" >&2
+          echo "this composite action needs an explicit install step." >&2
+          exit 1
+        fi
+        echo "yq: $(yq --version)"
 
     - name: Load autoagent config
       shell: bash

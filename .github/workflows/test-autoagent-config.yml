@@ -37,9 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install yq
-        uses: mikefarah/yq@v4.44.3
-
+      # yq: we rely on ubuntu-latest shipping it. If this ever stops being true
+      # the composite action's Verify step will fail loudly — see
+      # .github/actions/autoagent-setup/action.yml for the rationale.
       - name: Show yq version
         run: yq --version
 
