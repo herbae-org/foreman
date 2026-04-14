@@ -1,0 +1,22 @@
+# .github/actions/autoagent-setup/action.yml
+# Composite action: installs yq (pinned) and sources autoagent-config.sh,
+# exporting AUTOAGENT_* env vars into the calling job.
+#
+# Usage in a job:
+#   - uses: actions/checkout@v4
+#   - uses: ./.github/actions/autoagent-setup
+
+name: Autoagent setup
+description: Install yq and load autoagent-config.yml into the job environment.
+
+runs:
+  using: composite
+  steps:
+    - name: Install yq
+      uses: mikefarah/yq@v4.44.3
+
+    - name: Load autoagent config
+      shell: bash
+      run: |
+        source .github/scripts/autoagent-config.sh
+        env | grep '^AUTOAGENT_' >> "$GITHUB_ENV"
