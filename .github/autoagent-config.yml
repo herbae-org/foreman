@@ -1,0 +1,73 @@
+# .github/autoagent-config.yml
+# Central configuration for all autoagent-* workflows.
+# Every agent workflow sources .github/scripts/autoagent-config.sh which parses
+# this file with yq and exports the values as environment variables.
+
+github:
+  organization: "your-org"          # org or user that owns the Projects V2 board
+  repository: "your-org/your-repo"  # full OWNER/NAME
+  project_number: 1                 # Projects V2 board number
+
+board:
+  status_field: "Status"
+  columns:
+    todo: "Todo"
+    in_progress: "In Progress"
+    ready_for_qa: "Ready For QA"
+    done: "Done"
+
+milestones:
+  # Set use_iterations: true to ignore milestones and drive week rollover off a
+  # ProjectV2IterationField instead.
+  use_iterations: false
+  format: "YY CW WW"                 # only used in milestones mode
+  iteration_field: "Calendar Week"   # only used in iterations mode
+  done_status: "Done"                # only used in iterations mode
+
+labels:
+  priorities: ["p0", "p1", "p2", "p3", "p4", "p5"]
+  plan: "plan"       # Planner agent trigger label
+  high_risk: "risk/high"
+  medium_risk: "risk/medium"
+  low_risk: "risk/low"
+
+branch:
+  prefix: "autoagent/"
+
+severity_keywords:
+  # Reviewer comments matching these keywords block the merger.
+  blocking: ["CRITICAL", "MEDIUM"]
+
+agents:
+  planner:
+    enabled: true
+    model: "claude-sonnet-4-6"
+    max_turns: 80
+    timeout_minutes: 20
+  implementer:
+    enabled: true
+    model: "claude-opus-4-6"
+    max_turns: 500
+    timeout_minutes: 90
+    test_retry_budget: 3             # max times Claude may re-run failing tests
+  fixer:
+    enabled: true
+    model: "claude-sonnet-4-6"
+    max_turns: 500
+    timeout_minutes: 60
+  merger:
+    enabled: true
+    model: "claude-sonnet-4-6"
+    merge_method: "merge"            # merge | squash | rebase
+    pause_seconds: 10
+
+notifications:
+  provider: "telegram"               # telegram | slack | none
+  telegram:
+    bot_token_secret: "TELEGRAM_BOT_TOKEN"
+    chat_id_secret: "TELEGRAM_CHAT_ID"
+  slack:
+    webhook_secret: "SLACK_WEBHOOK_URL"
+
+runner:
+  labels: "ubuntu-latest"            # passed verbatim to `runs-on:`
