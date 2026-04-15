@@ -23,6 +23,15 @@ jobs:
       start_message: ${{ steps.msg.outputs.start_message }}
 
     steps:
+      - name: Checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Load autoagent config
+        uses: ./.github/actions/autoagent-setup
+
       - name: Scan for merge-ready PRs
         id: scan
         env:
@@ -33,11 +42,11 @@ jobs:
 
           PRS=$(gh pr list --repo "${{ github.repository }}" --state open \
             --json number,headRefName,mergeable,title \
-            --jq '.[] | select(.headRefName | startswith("autoagent/"))' 2>/dev/null || echo "")
+            --jq ".[] | select(.headRefName | startswith(\"${AUTOAGENT_BRANCH_PREFIX}\"))" 2>/dev/null || echo "")
 
           if [ -z "$PRS" ]; then
             echo "No open autoagent PRs found."
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -76,11 +85,11 @@ jobs:
               continue
             fi
 
-            # Check no CRITICAL or MEDIUM issues in review comments
+            # Check no blocking severity issues in review comments
             REVIEW_ISSUES=$(gh api "/repos/${{ github.repository }}/pulls/${NUM}/comments" \
-              --jq '[.[] | select(.body | test("\\bCRITICAL\\b|\\bMEDIUM\\b"))] | length' 2>/dev/null || echo "0")
+              --jq "[.[] | select(.body | test(\"${AUTOAGENT_SEVERITY_REGEX}\"))] | length" 2>/dev/null || echo "0")
             if [ "$REVIEW_ISSUES" -gt 0 ]; then
-              echo "  Has unresolved CRITICAL/MEDIUM issues in review comments. Skipping."
+              echo "  Has unresolved blocking severity issues in review comments. Skipping."
               continue
             fi
 
@@ -91,7 +100,7 @@ jobs:
 
           if [ ! -f /tmp/merger-ready-prs.txt ]; then
             echo "No merge-ready PRs found."
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -100,17 +109,19 @@ jobs:
 
           # Pass PR list as base64 to preserve newlines
           PR_LIST=$(cat /tmp/merger-ready-prs.txt | base64)
-          echo "pr_list=$PR_LIST" >> $GITHUB_OUTPUT
-          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "pr_list=$PR_LIST" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
           rm -f /tmp/merger-ready-prs.txt
 
       - name: Build start message
         id: msg
         if: steps.scan.outputs.skip != 'true'
+        env:
+          PR_LIST_B64: ${{ steps.scan.outputs.pr_list }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          PR_LIST=$(echo "${{ steps.scan.outputs.pr_list }}" | base64 -d)
+          PR_LIST=$(echo "$PR_LIST_B64" | base64 -d)
           PR_SUMMARY=$(echo "$PR_LIST" | while IFS='|' read -r NUM TITLE; do echo "• #${NUM}  - ${TITLE}"; done)
           {
             echo 'start_message<<EOF'
@@ -146,22 +157,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/prompts
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
           token: ${{ secrets.AGENT_PAT }}
+
+      - name: Load autoagent config
+        uses: ./.github/actions/autoagent-setup
 
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
-      # TODO: Change merge method if your repo uses squash or rebase
       - name: Merge PRs sequentially
         id: do-merge
         env:
           GH_TOKEN: ${{ secrets.AGENT_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_LIST_B64: ${{ needs.prepare.outputs.pr_list }}
         run: |
           set -e
 
-          echo "${{ needs.prepare.outputs.pr_list }}" | base64 -d > /tmp/merger-prs.txt
+          echo "$PR_LIST_B64" | base64 -d > /tmp/merger-prs.txt
 
           while IFS='|' read -r PR_NUM PR_TITLE; do
             echo "=== Merging PR #${PR_NUM}: ${PR_TITLE} ==="
@@ -203,8 +218,8 @@ jobs:
                 --jq '.[-10:] | .[].commit.message' 2>/dev/null || echo "")
 
               DECISION=$(export PR_NUM REVIEW_COMMENTS REVIEW_VERDICTS RECENT_COMMITS; \
-                git show origin/main:.github/prompts/merger.md | envsubst '$PR_NUM $REVIEW_COMMENTS $REVIEW_VERDICTS $RECENT_COMMITS' | \
-                claude -p --model claude-sonnet-4-6 --max-turns 1 --output-format text \
+                envsubst '$PR_NUM $REVIEW_COMMENTS $REVIEW_VERDICTS $RECENT_COMMITS' < .github/prompts/merger.md | \
+                claude -p --model "$AUTOAGENT_MERGER_MODEL" --max-turns 1 --output-format text \
                 2>/dev/null || echo "MERGE
           Claude unavailable, defaulting to merge")
 
@@ -219,8 +234,8 @@ jobs:
               echo "  Claude: ${REASON}"
             fi
 
-            # Merge (change --merge to --squash or --rebase if needed)
-            if gh pr merge "$PR_NUM" --repo "${{ github.repository }}" --merge 2>&1; then
+            # Merge using configured method
+            if gh pr merge "$PR_NUM" --repo "${{ github.repository }}" "--${AUTOAGENT_MERGER_METHOD}" 2>&1; then
               echo "  Merged!"
               echo "merged|#${PR_NUM}|${PR_TITLE}" >> /tmp/merger-results.txt
             else
@@ -229,7 +244,7 @@ jobs:
             fi
 
             # Brief pause for GitHub to process before next PR
-            sleep 10
+            sleep "$AUTOAGENT_MERGER_PAUSE"
 
           done < /tmp/merger-prs.txt
 

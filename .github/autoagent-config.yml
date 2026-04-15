@@ -20,7 +20,7 @@ milestones:
   # Set use_iterations: true to ignore milestones and drive week rollover off a
   # ProjectV2IterationField instead.
   use_iterations: false
-  format: "YY CW WW"                 # only used in milestones mode
+  format: "YY CW WW"                 # only used in milestones mode; changing this format also requires editing the THIS_TITLE/LAST_TITLE lines in auto-week-rollover.yml (shell date arithmetic)
   iteration_field: "Calendar Week"   # only used in iterations mode
   done_status: "Done"                # only used in iterations mode
 

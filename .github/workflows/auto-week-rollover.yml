@@ -14,16 +14,6 @@ on:
           - milestones
           - iterations
 
-env:
-  # TODO: Change these to your org and repo
-  REPO: your-org/your-repo
-  PROJECT_ORG: your-org
-  # TODO: Change to your GitHub Projects V2 number
-  PROJECT_NUMBER: 1
-  # Only used in iterations mode
-  ITERATION_FIELD: Calendar Week
-  DONE_STATUS: Done
-
 jobs:
   rollover:
     runs-on: ubuntu-latest
@@ -35,6 +25,15 @@ jobs:
       telegram_message: ${{ steps.rollover.outputs.telegram_message }}
 
     steps:
+      - name: Checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Load autoagent config
+        uses: ./.github/actions/autoagent-setup
+
       - name: Week Rollover
         id: rollover
         env:
@@ -49,7 +48,9 @@ jobs:
             # =============================================================
             # MILESTONES MODE
             # Uses GitHub milestones with format "YY CW WW" (e.g., "26 CW 14")
-            # TODO: Adjust milestone title format to match your convention
+            # The milestone title format is hardcoded here as shell date arithmetic.
+            # To change the format (see milestones.format in autoagent-config.yml),
+            # you must also edit the THIS_TITLE/LAST_TITLE lines below.
             # =============================================================
 
             # Determine this week and last week
@@ -69,7 +70,6 @@ jobs:
             LAST_TITLE="${LAST_YEAR} CW ${LAST_WEEK_NUM}"
 
             # Due date = end of this week (Sunday)
-            # NOTE: date -j is macOS syntax. For Linux runners, use the fallback:
             DOW=$(date -u +%u)  # 1=Monday, 7=Sunday
             DAYS_TO_SUNDAY=$((7 - DOW))
             THIS_DUE=$(date -j -v+${DAYS_TO_SUNDAY}d -u +%Y-%m-%dT12:00:00Z 2>/dev/null \
@@ -79,18 +79,18 @@ jobs:
             echo "Last week: $LAST_TITLE"
 
             # Upsert this week's milestone
-            THIS_MS_NUMBER=$(gh api "repos/$REPO/milestones" --jq \
+            THIS_MS_NUMBER=$(gh api "repos/${AUTOAGENT_REPO}/milestones" --jq \
               '.[] | select(.title == "'"$THIS_TITLE"'") | .number')
 
             if [ -n "$THIS_MS_NUMBER" ]; then
               echo "Milestone exists: #$THIS_MS_NUMBER  - updating due date"
-              gh api "repos/$REPO/milestones/$THIS_MS_NUMBER" \
+              gh api "repos/${AUTOAGENT_REPO}/milestones/$THIS_MS_NUMBER" \
                 -X PATCH \
                 -f due_on="$THIS_DUE" \
                 --silent
             else
               echo "Creating milestone: $THIS_TITLE (due: $THIS_DUE)"
-              THIS_MS_NUMBER=$(gh api "repos/$REPO/milestones" \
+              THIS_MS_NUMBER=$(gh api "repos/${AUTOAGENT_REPO}/milestones" \
                 -X POST \
                 -f title="$THIS_TITLE" \
                 -f due_on="$THIS_DUE" \
@@ -100,7 +100,7 @@ jobs:
             fi
 
             # Roll over last week's open issues (if any)
-            LAST_MILESTONE=$(gh api "repos/$REPO/milestones" --jq \
+            LAST_MILESTONE=$(gh api "repos/${AUTOAGENT_REPO}/milestones" --jq \
               '.[] | select(.title == "'"$LAST_TITLE"'") | {number, open_issues}')
 
             if [ -z "$LAST_MILESTONE" ]; then
@@ -112,12 +112,12 @@ jobs:
               echo "Found: $LAST_TITLE (milestone #$LAST_MS_NUMBER, $OPEN_COUNT open issues)"
 
               if [ "$OPEN_COUNT" -gt 0 ]; then
-                gh issue list --repo "$REPO" --milestone "$LAST_TITLE" --state open --json number,title --jq '.[]' \
+                gh issue list --repo "${AUTOAGENT_REPO}" --milestone "$LAST_TITLE" --state open --json number,title --jq '.[]' \
                   | jq -c '.' | while read -r ISSUE; do
                     ISSUE_NUM=$(echo "$ISSUE" | jq -r '.number')
                     ISSUE_TITLE=$(echo "$ISSUE" | jq -r '.title')
 
-                    gh api "repos/$REPO/issues/$ISSUE_NUM" \
+                    gh api "repos/${AUTOAGENT_REPO}/issues/$ISSUE_NUM" \
                       -X PATCH \
                       -F milestone="$THIS_MS_NUMBER" \
                       --silent
@@ -127,8 +127,8 @@ jobs:
 
                 echo "Moved $OPEN_COUNT issues from $LAST_TITLE → $THIS_TITLE"
 
-                # Telegram notification
-                ISSUES_TEXT=$(gh issue list --repo "$REPO" --milestone "$THIS_TITLE" --state open --json number,title \
+                # Notification
+                ISSUES_TEXT=$(gh issue list --repo "${AUTOAGENT_REPO}" --milestone "$THIS_TITLE" --state open --json number,title \
                   --jq '.[] | "• #\(.number)  - \(.title)"')
 
                 {
@@ -141,9 +141,9 @@ jobs:
               fi
 
               # Close last week's milestone if no open issues remain
-              REMAINING=$(gh api "repos/$REPO/milestones/$LAST_MS_NUMBER" --jq '.open_issues')
+              REMAINING=$(gh api "repos/${AUTOAGENT_REPO}/milestones/$LAST_MS_NUMBER" --jq '.open_issues')
               if [ "$REMAINING" -eq 0 ]; then
-                gh api "repos/$REPO/milestones/$LAST_MS_NUMBER" \
+                gh api "repos/${AUTOAGENT_REPO}/milestones/$LAST_MS_NUMBER" \
                   -X PATCH \
                   -f state="closed" \
                   --silent
@@ -160,10 +160,10 @@ jobs:
             # Fetch project metadata
             PROJECT_DATA=$(gh api graphql -f query='
               query {
-                organization(login: "'"$PROJECT_ORG"'") {
-                  projectV2(number: '"$PROJECT_NUMBER"') {
+                organization(login: "'"$AUTOAGENT_ORG"'") {
+                  projectV2(number: '"$AUTOAGENT_PROJECT_NUMBER"') {
                     id
-                    field(name: "'"$ITERATION_FIELD"'") {
+                    field(name: "'"$AUTOAGENT_ITERATION_FIELD"'") {
                       ... on ProjectV2IterationField {
                         id
                         configuration {
@@ -240,17 +240,17 @@ jobs:
             # Find items in current CW that are NOT Done
             ITEMS=$(gh api graphql -f query='
               query {
-                organization(login: "'"$PROJECT_ORG"'") {
-                  projectV2(number: '"$PROJECT_NUMBER"') {
+                organization(login: "'"$AUTOAGENT_ORG"'") {
+                  projectV2(number: '"$AUTOAGENT_PROJECT_NUMBER"') {
                     items(first: 100) {
                       nodes {
                         id
-                        fieldValueByName(name: "'"$ITERATION_FIELD"'") {
+                        fieldValueByName(name: "'"$AUTOAGENT_ITERATION_FIELD"'") {
                           ... on ProjectV2ItemFieldIterationValue {
                             iterationId
                           }
                         }
-                        status: fieldValueByName(name: "Status") {
+                        status: fieldValueByName(name: "'"$AUTOAGENT_STATUS_FIELD"'") {
                           ... on ProjectV2ItemFieldSingleSelectValue {
                             name
                           }
@@ -269,7 +269,7 @@ jobs:
               }
             ')
 
-            ROLLOVER_ITEMS=$(echo "$ITEMS" | jq --arg cwId "$CURRENT_CW_ID" --arg done "$DONE_STATUS" '[
+            ROLLOVER_ITEMS=$(echo "$ITEMS" | jq --arg cwId "$CURRENT_CW_ID" --arg done "$AUTOAGENT_DONE_STATUS" '[
               .data.organization.projectV2.items.nodes[]
               | select(.fieldValueByName.iterationId == $cwId)
               | select(.status.name != $done)

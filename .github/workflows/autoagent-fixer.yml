@@ -52,29 +52,45 @@ jobs:
       branch: ${{ steps.pr.outputs.branch }}
       base: ${{ steps.pr.outputs.base }}
       model: ${{ steps.pr.outputs.model }}
+      timeout: ${{ steps.pr.outputs.timeout }}
       start_message: ${{ steps.msg.outputs.start_message }}
 
     steps:
+      - name: Checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Load autoagent config
+        uses: ./.github/actions/autoagent-setup
+
       - name: Determine PR to fix
         id: pr
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          INPUT_MODEL: ${{ github.event.inputs.model }}
+          CHECK_SUITE_HEAD_SHA: ${{ github.event.check_suite.head_sha }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.pr_number }}" ]; then
-            PR_NUM="${{ github.event.inputs.pr_number }}"
-            MODEL="${{ github.event.inputs.model }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_PR_NUMBER" ]; then
+            PR_NUM="$INPUT_PR_NUMBER"
+            MODEL="$INPUT_MODEL"
 
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$EVENT_NAME" = "schedule" ]; then
             # Scan for first autoagent PR needing fixes
             echo "=== Scanning for autoagent PRs needing fixes ==="
-            MODEL="${{ github.event.inputs.model || 'claude-sonnet-4-6' }}"
+            MODEL="${INPUT_MODEL:-$AUTOAGENT_FIXER_MODEL}"
             PR_NUM=""
 
             PRS=$(gh pr list --repo "${{ github.repository }}" --state open \
               --json number,headRefName,mergeable \
-              --jq '.[] | select(.headRefName | startswith("autoagent/"))' 2>/dev/null || echo "")
+              --jq ".[] | select(.headRefName | startswith(\"${AUTOAGENT_BRANCH_PREFIX}\"))" 2>/dev/null || echo "")
 
             if [ -z "$PRS" ]; then
               echo "No open autoagent PRs found."
-              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
@@ -126,48 +142,49 @@ jobs:
               echo "Selected PR #${PR_NUM} for fixing"
             else
               echo "All autoagent PRs are clean (or already being fixed)."
-              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
           else
             # check_suite event
-            PR_NUM=$(gh api "/repos/${{ github.repository }}/commits/${{ github.event.check_suite.head_sha }}/pulls" \
+            PR_NUM=$(gh api "/repos/${{ github.repository }}/commits/${CHECK_SUITE_HEAD_SHA}/pulls" \
               --jq '.[0].number // empty' 2>/dev/null || echo "")
-            MODEL="claude-sonnet-4-6"
+            MODEL="$AUTOAGENT_FIXER_MODEL"
           fi
 
           if [ -z "$PR_NUM" ]; then
             echo "No PR found. Skipping."
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Only fix autoagent PRs
           PR_BRANCH=$(gh pr view "$PR_NUM" --json headRefName -q '.headRefName')
-          if [[ ! "$PR_BRANCH" =~ ^autoagent/ ]]; then
+          if [[ ! "$PR_BRANCH" =~ ^${AUTOAGENT_BRANCH_PREFIX} ]]; then
             echo "PR #$PR_NUM is not an autoagent branch. Skipping."
-            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           PR_BASE=$(gh pr view "$PR_NUM" --json baseRefName -q '.baseRefName')
-          echo "number=$PR_NUM" >> $GITHUB_OUTPUT
-          echo "branch=$PR_BRANCH" >> $GITHUB_OUTPUT
-          echo "base=$PR_BASE" >> $GITHUB_OUTPUT
-          echo "model=$MODEL" >> $GITHUB_OUTPUT
-          echo "skip=false" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          echo "number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base=$PR_BASE" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "timeout=$AUTOAGENT_FIXER_TIMEOUT" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Build start message
         id: msg
         if: steps.pr.outputs.skip != 'true'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           {
             echo 'start_message<<EOF'
-            echo "[AUTOAGENT] Fixer  - PR #${{ steps.pr.outputs.number }}"
+            echo "[AUTOAGENT] Fixer  - PR #${PR_NUMBER}"
             echo "${RUN_URL}"
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
@@ -193,7 +210,7 @@ jobs:
       issues: read
       checks: read
       actions: read
-    timeout-minutes: 60
+    timeout-minutes: ${{ fromJSON(needs.prepare.outputs.timeout) }}
     outputs:
       after_message: ${{ steps.summary.outputs.after_message }}
 
@@ -205,6 +222,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.AGENT_PAT }}
 
+      - name: Load autoagent config
+        uses: ./.github/actions/autoagent-setup
+
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
@@ -213,10 +233,12 @@ jobs:
       #   run: npm install
 
       - name: Gather failure context
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          PR_NUM: ${{ needs.prepare.outputs.number }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          BASE: ${{ needs.prepare.outputs.base }}
         run: |
-          PR_NUM="${{ needs.prepare.outputs.number }}"
-          BRANCH="${{ needs.prepare.outputs.branch }}"
-
           echo "# Failure Context for PR #${PR_NUM}" > /tmp/failure-context.md
 
           # CI check results
@@ -247,39 +269,39 @@ jobs:
           if [ "$MERGEABLE" = "CONFLICTING" ]; then
             echo "" >> /tmp/failure-context.md
             echo "## MERGE CONFLICT" >> /tmp/failure-context.md
-            echo "PR has conflicts with base branch (${{ needs.prepare.outputs.base }}). Rebase required." >> /tmp/failure-context.md
+            echo "PR has conflicts with base branch (${BASE}). Rebase required." >> /tmp/failure-context.md
           fi
 
           sed 's/::\(error\|warning\)::/[\1]/g' /tmp/failure-context.md
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_PAT }}
 
       - name: Run Claude Fixer
         id: claude-run
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUM: ${{ needs.prepare.outputs.number }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          CLAUDE_MODEL: ${{ needs.prepare.outputs.model }}
         run: |
           echo "pre_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-          PR_NUM="${{ needs.prepare.outputs.number }}"
-          BRANCH="${{ needs.prepare.outputs.branch }}"
-          BASE="${{ needs.prepare.outputs.base }}"
           CONTEXT=$(cat /tmp/failure-context.md)
 
           export PR_NUM BRANCH BASE CONTEXT
-          git show origin/main:.github/prompts/fixer.md | envsubst '$PR_NUM $BRANCH $BASE $CONTEXT' | \
-            claude -p --verbose --output-format stream-json --model "${{ needs.prepare.outputs.model }}" --max-turns 500 \
+          envsubst '$PR_NUM $BRANCH $BASE $CONTEXT' < .github/prompts/fixer.md | \
+            claude -p --verbose --output-format stream-json --model "$CLAUDE_MODEL" --max-turns "$AUTOAGENT_FIXER_MAX_TURNS" \
               --permission-mode auto
 
       - name: Re-trigger CI if no changes were made
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          PR_NUM: ${{ needs.prepare.outputs.number }}
+          PRE_SHA: ${{ steps.claude-run.outputs.pre_sha }}
         run: |
-          BRANCH="${{ needs.prepare.outputs.branch }}"
-          BASE="${{ needs.prepare.outputs.base }}"
-          PR_NUM="${{ needs.prepare.outputs.number }}"
-
           # Check if Claude made any new commits
           # Compare HEAD against pre-Claude SHA (can't use remote — Claude pushes its own commits)
-          PRE_SHA="${{ steps.claude-run.outputs.pre_sha }}"
           POST_SHA=$(git rev-parse HEAD)
 
           if [ "$PRE_SHA" = "$POST_SHA" ]; then
@@ -302,19 +324,20 @@ jobs:
           else
             echo "Fixer made changes. CI will be triggered by the push."
           fi
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_PAT }}
 
       - name: Capture fix summary
         id: summary
         if: always()
+        env:
+          PR_NUM: ${{ needs.prepare.outputs.number }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          CLAUDE_MODEL: ${{ needs.prepare.outputs.model }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          PR_NUM="${{ needs.prepare.outputs.number }}"
-
           # Human-readable summary from commit messages
-          COMMITS=$(git log --pretty="- %s" origin/${{ needs.prepare.outputs.base }}..HEAD 2>/dev/null | head -20 || echo "- No commits found")
-          FILES_CHANGED=$(git diff --name-only origin/${{ needs.prepare.outputs.base }}..HEAD 2>/dev/null | wc -l | tr -d ' ')
-          BRANCH="${{ needs.prepare.outputs.branch }}"
+          COMMITS=$(git log --pretty="- %s" "origin/${BASE}..HEAD" 2>/dev/null | head -20 || echo "- No commits found")
+          FILES_CHANGED=$(git diff --name-only "origin/${BASE}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
 
           # Job summary
           {
@@ -323,10 +346,10 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| **PR** | #${PR_NUM} |"
-            echo "| **Status** | ${{ job.status }} |"
-            echo "| **Model** | ${{ needs.prepare.outputs.model }} |"
+            echo "| **Status** | ${JOB_STATUS} |"
+            echo "| **Model** | ${CLAUDE_MODEL} |"
             echo "| **Branch** | \`${BRANCH}\` |"
-            echo "| **Base** | \`${{ needs.prepare.outputs.base }}\` |"
+            echo "| **Base** | \`${BASE}\` |"
             echo "| **Files changed** | ${FILES_CHANGED} |"
             echo ""
             echo "### Commits"
@@ -344,8 +367,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Re-request reviewers
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          PR_NUM: ${{ needs.prepare.outputs.number }}
         run: |
-          PR_NUM="${{ needs.prepare.outputs.number }}"
           REVIEWERS=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUM}/reviews" \
             --jq '[.[].user.login] | unique' 2>/dev/null || echo "[]")
           if [ "$REVIEWERS" != "[]" ]; then
@@ -355,20 +380,22 @@ jobs:
               echo "Re-requested review from: $USER"
             done
           fi
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_PAT }}
 
       - name: Log run
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          PR_NUM: ${{ needs.prepare.outputs.number }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          CLAUDE_MODEL: ${{ needs.prepare.outputs.model }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          PR_NUM="${{ needs.prepare.outputs.number }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          STATUS="${{ job.status }}"
 
-          COMMITS=$(git log --pretty="- %s" origin/${{ needs.prepare.outputs.base }}..HEAD 2>/dev/null | head -20 || echo "- No new commits")
-          FILES_CHANGED=$(git diff --name-only origin/${{ needs.prepare.outputs.base }}..HEAD 2>/dev/null | wc -l | tr -d ' ')
+          COMMITS=$(git log --pretty="- %s" "origin/${BASE}..HEAD" 2>/dev/null | head -20 || echo "- No new commits")
+          FILES_CHANGED=$(git diff --name-only "origin/${BASE}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
 
-          if [ "$STATUS" = "success" ]; then
+          if [ "$JOB_STATUS" = "success" ]; then
             ICON="🔧"
           else
             ICON="❌"
@@ -376,16 +403,14 @@ jobs:
 
           BODY="${ICON} **Fixer run** - [workflow run](${RUN_URL})
 
-          **Status:** ${STATUS}
-          **Model:** ${{ needs.prepare.outputs.model }}
+          **Status:** ${JOB_STATUS}
+          **Model:** ${CLAUDE_MODEL}
           **Files changed:** ${FILES_CHANGED}
 
           **Commits:**
           ${COMMITS}"
 
           gh pr comment "$PR_NUM" --body "$BODY"
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_PAT }}
 
   notify-done:
     needs: fix

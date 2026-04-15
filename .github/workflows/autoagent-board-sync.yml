@@ -6,15 +6,12 @@ on:
   #   branches: [main]
   workflow_dispatch:
 
-env:
-  # TODO: Change to your GitHub org
-  PROJECT_ORG: your-org
-  # TODO: Change to your GitHub Projects V2 number
-  PROJECT_NUMBER: 1
-
 jobs:
   sync:
-    # Only for autoagent branches
+    # Only for autoagent branches.
+    # NOTE: Job-level `if:` expressions cannot reference env vars, so the branch
+    # prefix is hardcoded here. If you change branch.prefix in autoagent-config.yml,
+    # update this expression too.
     if: startsWith(github.head_ref, 'autoagent/')
     runs-on: ubuntu-latest
     permissions:
@@ -37,59 +34,87 @@ jobs:
           BRANCH: ${{ github.head_ref }}
         run: |
           # Extract issue number from branch name: autoagent/353-wire-categorization-rules → 353
-          ISSUE_NUM=$(echo "$BRANCH" | sed 's|autoagent/||' | grep -oE '^[0-9]+')
+          ISSUE_NUM=$(echo "$BRANCH" | sed "s|${AUTOAGENT_BRANCH_PREFIX}||" | grep -oE '^[0-9]+')
           echo "number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
           echo "Issue: #$ISSUE_NUM from branch: $BRANCH"
 
       - name: Get project item ID
         id: project
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
         run: |
           ISSUE_NUM="${{ steps.issue.outputs.number }}"
 
-          # Get project item ID for this issue
-          ITEM_DATA=$(gh api graphql -f query="
-            query {
-              organization(login: \"$PROJECT_ORG\") {
-                projectV2(number: $PROJECT_NUMBER) {
-                  id
-                  items(first: 100) {
-                    nodes {
-                      id
-                      content {
-                        ... on Issue {
-                          number
+          # Get project item ID for this issue, paginating until found.
+          # TODO(autoagent-config): pagination if board grows beyond 100 items — cursor loop below handles it.
+          HAS_NEXT="true"
+          CURSOR=""
+          ITEM_ID=""
+          PROJECT_ID=""
+          FIELD_ID=""
+          READY_FOR_QA_ID=""
+          DONE_ID=""
+
+          while [ "$HAS_NEXT" = "true" ]; do
+            if [ -z "$CURSOR" ]; then
+              CURSOR_ARG="null"
+            else
+              CURSOR_ARG="\"$CURSOR\""
+            fi
+
+            PAGE_DATA=$(gh api graphql -f query="
+              query {
+                organization(login: \"${AUTOAGENT_ORG}\") {
+                  projectV2(number: ${AUTOAGENT_PROJECT_NUMBER}) {
+                    id
+                    items(first: 100, after: ${CURSOR_ARG}) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        id
+                        content {
+                          ... on Issue {
+                            number
+                          }
                         }
                       }
                     }
-                  }
-                  field(name: \"Status\") {
-                    ... on ProjectV2SingleSelectField {
-                      id
-                      options { id name }
+                    field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        options { id name }
+                      }
                     }
                   }
                 }
               }
-            }
-          ")
+            ")
 
-          PROJECT_ID=$(echo "$ITEM_DATA" | jq -r '.data.organization.projectV2.id')
-          FIELD_ID=$(echo "$ITEM_DATA" | jq -r '.data.organization.projectV2.field.id')
-          ITEM_ID=$(echo "$ITEM_DATA" | jq -r ".data.organization.projectV2.items.nodes[] | select(.content.number == ${ISSUE_NUM}) | .id")
+            if [ -z "$PROJECT_ID" ]; then
+              PROJECT_ID=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.id')
+              FIELD_ID=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.field.id')
+              READY_FOR_QA_ID=$(echo "$PAGE_DATA" | jq -r ".data.organization.projectV2.field.options[] | select(.name == \"${AUTOAGENT_COL_READY_FOR_QA}\") | .id")
+              DONE_ID=$(echo "$PAGE_DATA" | jq -r ".data.organization.projectV2.field.options[] | select(.name == \"${AUTOAGENT_COL_DONE}\") | .id")
+            fi
 
-          # TODO: Adjust these status names to match your project board columns
-          READY_FOR_QA_ID=$(echo "$ITEM_DATA" | jq -r '.data.organization.projectV2.field.options[] | select(.name == "Ready For QA") | .id')
-          DONE_ID=$(echo "$ITEM_DATA" | jq -r '.data.organization.projectV2.field.options[] | select(.name == "Done") | .id')
+            FOUND=$(echo "$PAGE_DATA" | jq -r ".data.organization.projectV2.items.nodes[] | select(.content.number == ${ISSUE_NUM}) | .id")
+            if [ -n "$FOUND" ]; then
+              ITEM_ID="$FOUND"
+              break
+            fi
 
-          echo "projectId=$PROJECT_ID" >> $GITHUB_OUTPUT
-          echo "fieldId=$FIELD_ID" >> $GITHUB_OUTPUT
-          echo "itemId=$ITEM_ID" >> $GITHUB_OUTPUT
-          echo "readyForQaId=$READY_FOR_QA_ID" >> $GITHUB_OUTPUT
-          echo "doneId=$DONE_ID" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+            HAS_NEXT=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
+            CURSOR=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor')
+          done
 
-      # TODO: Adjust status name "Ready For QA" to match your board
+          echo "projectId=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+          echo "fieldId=$FIELD_ID" >> "$GITHUB_OUTPUT"
+          echo "itemId=$ITEM_ID" >> "$GITHUB_OUTPUT"
+          echo "readyForQaId=$READY_FOR_QA_ID" >> "$GITHUB_OUTPUT"
+          echo "doneId=$DONE_ID" >> "$GITHUB_OUTPUT"
+
       - name: Move to READY FOR QA (on PR opened)
         if: github.event.action == 'opened'
         run: |
@@ -202,12 +227,11 @@ jobs:
           ISSUE_NUM="${{ steps.issue.outputs.number }}"
           echo "PR closed without merge for #${ISSUE_NUM}  - moving back to TODO"
 
-          # TODO: Adjust "Todo" to match your board's column name
           TODO_ID=$(gh api graphql -f query="
             query {
               node(id: \"${{ steps.project.outputs.projectId }}\") {
                 ... on ProjectV2 {
-                  field(name: \"Status\") {
+                  field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
                     ... on ProjectV2SingleSelectField {
                       options { id name }
                     }
@@ -215,7 +239,7 @@ jobs:
                 }
               }
             }
-          " --jq '.data.node.field.options[] | select(.name == "Todo") | .id')
+          " --jq ".data.node.field.options[] | select(.name == \"${AUTOAGENT_COL_TODO}\") | .id")
 
           gh api graphql -f query="
             mutation {
