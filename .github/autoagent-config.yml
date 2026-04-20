@@ -4,9 +4,9 @@
 # this file with yq and exports the values as environment variables.
 
 github:
-  organization: "your-org"          # org or user that owns the Projects V2 board
-  repository: "your-org/your-repo"  # full OWNER/NAME
-  project_number: 1                 # Projects V2 board number
+  organization: "herbae-org"                     # org or user that owns the Projects V2 board
+  repository: "herbae/three-body-agent-spike"    # full OWNER/NAME
+  project_number: 1                              # Projects V2 board number
 
 board:
   status_field: "Status"
@@ -62,7 +62,7 @@ agents:
     pause_seconds: 10
 
 notifications:
-  provider: "telegram"               # telegram | slack | none
+  provider: "none"                   # telegram | slack | none
   telegram:
     bot_token_secret: "TELEGRAM_BOT_TOKEN"
     chat_id_secret: "TELEGRAM_CHAT_ID"
