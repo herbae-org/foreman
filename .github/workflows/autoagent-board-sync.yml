@@ -46,7 +46,6 @@ jobs:
           ISSUE_NUM="${{ steps.issue.outputs.number }}"
 
           # Get project item ID for this issue, paginating until found.
-          # TODO(autoagent-config): pagination if board grows beyond 100 items — cursor loop below handles it.
           HAS_NEXT="true"
           CURSOR=""
           ITEM_ID=""
@@ -108,6 +107,28 @@ jobs:
             HAS_NEXT=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
             CURSOR=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor')
           done
+
+          # Validate that the issue was found on the board and all required field IDs resolved.
+          if [ -z "$ITEM_ID" ] || [ "$ITEM_ID" = "null" ]; then
+            echo "::error::Issue #$ISSUE_NUM not found on project board (org=$AUTOAGENT_ORG, project=$AUTOAGENT_PROJECT_NUMBER)"
+            exit 1
+          fi
+          if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+            echo "::error::Board misconfigured: PROJECT_ID=$PROJECT_ID"
+            exit 1
+          fi
+          if [ -z "$FIELD_ID" ] || [ "$FIELD_ID" = "null" ]; then
+            echo "::error::Board misconfigured: FIELD_ID=$FIELD_ID (check AUTOAGENT_STATUS_FIELD='$AUTOAGENT_STATUS_FIELD')"
+            exit 1
+          fi
+          if [ -z "$READY_FOR_QA_ID" ] || [ "$READY_FOR_QA_ID" = "null" ]; then
+            echo "::error::Board misconfigured: READY_FOR_QA_ID=$READY_FOR_QA_ID (check AUTOAGENT_COL_READY_FOR_QA='$AUTOAGENT_COL_READY_FOR_QA')"
+            exit 1
+          fi
+          if [ -z "$DONE_ID" ] || [ "$DONE_ID" = "null" ]; then
+            echo "::error::Board misconfigured: DONE_ID=$DONE_ID (check AUTOAGENT_COL_DONE='$AUTOAGENT_COL_DONE')"
+            exit 1
+          fi
 
           echo "projectId=$PROJECT_ID" >> "$GITHUB_OUTPUT"
           echo "fieldId=$FIELD_ID" >> "$GITHUB_OUTPUT"
