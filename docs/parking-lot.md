@@ -54,6 +54,18 @@ Mitigations to consider:
 
 Not blocking while the org is single-contributor, but should land before we open the repo to external collaborators.
 
+## Implementer `Comment on success` race condition
+
+**Surfaced by:** 2026-04-20 Planner smoke-test (issue #4 / run `24680644485`).
+
+The Implementer's `Comment on success` step (`autoagent-implementer.yml:~414`) calls `gh pr list --search "head:${AUTOAGENT_BRANCH_PREFIX}${ISSUE_NUMBER}" --state open` to find the just-opened PR URL and comment on the issue. GitHub's PR search index has a few-second lag — the search ran ~6s after `gh pr create` and returned empty. The `|| echo ""` fallback swallows the race, so the step exits 0 but no comment is posted.
+
+Fix options:
+- Swap the search for a direct `gh api` call to `/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open` (no search index in the loop).
+- Or add a short retry: `for i in 1 2 3; do PR_URL=$(gh pr list ...); [ -n "$PR_URL" ] && break; sleep 3; done`.
+
+Not critical — the PR still opens and the board still transitions; the issue just doesn't get the convenience comment. First-class priority the next time we touch the Implementer workflow.
+
 ## Upgrade `actions/checkout@v4 → @v5`
 
 GitHub CI annotates that `actions/checkout@v4` uses Node.js 20 — deprecated June 2026. Bump to `@v5` across all workflows when convenient.
