@@ -191,7 +191,6 @@ jobs:
 
           ISSUE_NUM=$(echo "$BEST_ISSUE" | jq -r '.number')
           ISSUE_TITLE=$(echo "$BEST_ISSUE" | jq -r '.title')
-          ITEM_ID=$(echo "$BEST_ISSUE" | jq -r '.itemId')
 
           if [ -z "$ISSUE_NUM" ] || [ "$ISSUE_NUM" = "null" ]; then
             echo "No suitable issue found."
@@ -222,58 +221,10 @@ jobs:
             fi
           fi
 
-          # Move to IN PROGRESS on the board
-          PROJECT_ID=$(gh api graphql -f query='
-            query {
-              organization(login: "'"$AUTOAGENT_ORG"'") {
-                projectV2(number: '"$AUTOAGENT_PROJECT_NUMBER"') { id }
-              }
-            }
-          ' --jq '.data.organization.projectV2.id')
-
-          STATUS_FIELD_ID=$(gh api graphql -f query="
-            query {
-              node(id: \"${PROJECT_ID}\") {
-                ... on ProjectV2 {
-                  field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
-                    ... on ProjectV2SingleSelectField {
-                      id
-                      options { id name }
-                    }
-                  }
-                }
-              }
-            }
-          " --jq '.data.node.field.id')
-
-          IN_PROGRESS_ID=$(gh api graphql -f query="
-            query {
-              node(id: \"${PROJECT_ID}\") {
-                ... on ProjectV2 {
-                  field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
-                    ... on ProjectV2SingleSelectField {
-                      options { id name }
-                    }
-                  }
-                }
-              }
-            }
-          " --jq ".data.node.field.options[] | select(.name == \"${AUTOAGENT_COL_IN_PROGRESS}\") | .id")
-
-          gh api graphql -f query="
-            mutation {
-              updateProjectV2ItemFieldValue(input: {
-                projectId: \"${PROJECT_ID}\"
-                itemId: \"${ITEM_ID}\"
-                fieldId: \"${STATUS_FIELD_ID}\"
-                value: { singleSelectOptionId: \"${IN_PROGRESS_ID}\" }
-              }) {
-                projectV2Item { id }
-              }
-            }
-          "
-
-          echo "Moved #${ISSUE_NUM} to IN PROGRESS"
+          # NOTE: the Todo → In Progress move is unified for both dispatch and
+          # scheduled paths in the `implement` job's "Move card to In Progress"
+          # step below. Keeping the move there means any trigger path (Planner
+          # dispatch, manual dispatch, scheduled scan) exercises the same logic.
 
           echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
           echo "issue_title=$ISSUE_TITLE" >> "$GITHUB_OUTPUT"
@@ -345,6 +296,79 @@ jobs:
           ISSUE_NUMBER: ${{ needs.prepare.outputs.issue_number }}
         run: |
           gh issue view "$ISSUE_NUMBER" --json title,body,labels > /tmp/issue.json
+
+      - name: Move card to In Progress
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          ISSUE_NUM: ${{ needs.prepare.outputs.issue_number }}
+        run: |
+          set -eo pipefail
+
+          # Look up the project item directly from the issue (O(1) vs paginating
+          # the whole board). An issue can be on multiple projects; we filter by
+          # AUTOAGENT_PROJECT_NUMBER.
+          REPO_OWNER="${AUTOAGENT_REPO%%/*}"
+          REPO_NAME="${AUTOAGENT_REPO##*/}"
+          ITEM_ID=$(gh api graphql \
+            -f query='
+              query($owner: String!, $repo: String!, $num: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $num) {
+                    projectItems(first: 20, includeArchived: false) {
+                      nodes { id project { number } }
+                    }
+                  }
+                }
+              }' \
+            -F owner="$REPO_OWNER" -F repo="$REPO_NAME" -F num="$ISSUE_NUM" \
+            --jq ".data.repository.issue.projectItems.nodes[] | select(.project.number == $AUTOAGENT_PROJECT_NUMBER) | .id")
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "::warning::Issue #$ISSUE_NUM not on project $AUTOAGENT_PROJECT_NUMBER — skipping In Progress move"
+            exit 0
+          fi
+
+          PROJECT_ID=$(gh api graphql -f query='
+            query {
+              organization(login: "'"$AUTOAGENT_ORG"'") {
+                projectV2(number: '"$AUTOAGENT_PROJECT_NUMBER"') { id }
+              }
+            }' --jq '.data.organization.projectV2.id')
+
+          FIELD_RESPONSE=$(gh api graphql -f query="
+            query {
+              node(id: \"${PROJECT_ID}\") {
+                ... on ProjectV2 {
+                  field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      options { id name }
+                    }
+                  }
+                }
+              }
+            }")
+          FIELD_ID=$(echo "$FIELD_RESPONSE" | jq -r '.data.node.field.id')
+          IN_PROGRESS_ID=$(echo "$FIELD_RESPONSE" | jq -r ".data.node.field.options[] | select(.name == \"$AUTOAGENT_COL_IN_PROGRESS\") | .id")
+
+          if [ -z "$IN_PROGRESS_ID" ] || [ "$IN_PROGRESS_ID" = "null" ]; then
+            echo "::error::Column '$AUTOAGENT_COL_IN_PROGRESS' not found in Status field"
+            exit 1
+          fi
+
+          gh api graphql -f query="
+            mutation {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: \"${PROJECT_ID}\"
+                itemId: \"${ITEM_ID}\"
+                fieldId: \"${FIELD_ID}\"
+                value: { singleSelectOptionId: \"${IN_PROGRESS_ID}\" }
+              }) {
+                projectV2Item { id }
+              }
+            }" > /dev/null
+
+          echo "Moved #$ISSUE_NUM to $AUTOAGENT_COL_IN_PROGRESS"
 
       - name: Fetch change-set (if present)
         id: changeset
