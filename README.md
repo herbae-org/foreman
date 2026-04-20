@@ -1,287 +1,415 @@
-# Three-Body Agent
+# AI Factory
 
-An autonomous development pipeline powered by GitHub Actions and Claude Code CLI. Five workflows that pick issues from a project board, implement them, fix their own CI failures, merge green PRs, and keep the board updated - all without human intervention.
+An autonomous issue-to-merged-code pipeline built on GitHub Actions and the
+Claude Code CLI. Four agents -- Planner, Implementer, Fixer, Merger -- pick
+issues from a GitHub Projects V2 board, produce a risk-classified change-set,
+implement it, fix their own CI failures, and merge green PRs, all without human
+intervention. The only runtime dependencies are `gh`, `jq`, `yq`, and `curl`.
+High-risk changes pause the pipeline for human approval; everything else flows
+through automatically.
+
+## Agents
+
+### Planner
+
+Triggered when the `plan` label is added to an issue (or via `workflow_dispatch`).
+Reads the issue, the repo context (`CLAUDE.md`, `ARCHITECTURE.md`, manifests),
+and produces a change-set document with YAML frontmatter specifying scope, files
+to touch, API contract changes, a test plan, and a risk classification. The
+workflow routes the change-set based on risk: low/medium posts it as an issue
+comment and dispatches the Implementer automatically; high commits it to
+`docs/change-sets/<N>.md` and opens a spec PR that pauses the pipeline until a
+human approves.
+
+- Workflow: `.github/workflows/autoagent-planner.yml`
+- Prompt: `.github/prompts/planner.md`
+
+### Implementer
+
+Picks the highest-priority `Todo` issue from the current milestone on the
+Projects V2 board, moves it to `In Progress`, creates a branch, hands the issue
+to Claude Code for autonomous implementation, runs tests (with a configurable
+retry budget), and opens a PR. Also accepts `workflow_dispatch` from the Planner
+for direct dispatch.
+
+- Workflow: `.github/workflows/autoagent-implementer.yml`
+- Prompt: `.github/prompts/implementer.md`
+
+### Fixer
+
+Fires on CI failures, review comments, or merge conflicts on `autoagent/*`
+branches. Gathers all failure context (run logs, inline review comments, review
+verdicts, mergeable status), feeds it to Claude, and pushes fixes. Deduplicates
+against other in-progress fixer runs so no PR is worked on twice.
+
+- Workflow: `.github/workflows/autoagent-fixer.yml`
+- Prompt: `.github/prompts/fixer.md`
+
+### Merger
+
+Scans for `autoagent/*` PRs where all checks pass, no changes are requested, no
+unresolved `CRITICAL`/`MEDIUM` issues exist, and no merge conflicts remain.
+Before merging, Claude reviews recent commits against review comments and returns
+a `MERGE` or `SKIP` verdict. PRs are merged sequentially, with re-verification
+between each merge.
+
+- Workflow: `.github/workflows/autoagent-merger.yml`
+- Prompt: `.github/prompts/merger.md`
+
+Two support workflows keep the board and calendar consistent:
+
+| Workflow | Purpose |
+|---|---|
+| `autoagent-board-sync.yml` | Moves the issue between Projects V2 columns on PR events |
+| `auto-week-rollover.yml` | Creates this week's milestone/iteration, rolls unfinished work forward |
+
+Notifications are handled by the reusable workflow `notify.yml`, which
+dispatches to the configured provider (Telegram, Slack, or none).
+
+## State machine
+
+All state is expressed as Projects V2 `Status` column transitions driven by
+branch name conventions and PR events.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  GitHub Actions                     │
-│              (Autonomous Brain)                     │
-│                                                     │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │ Implementer │  │    Fixer    │  │   Merger    │  │
-│  │  (hourly)   │  │ (every 30m) │  │ (every 2h)  │  │
-│  └─────────────┘  └─────────────┘  └─────────────┘  │
-│                                                     │
-│  ┌─────────────┐  ┌─────────────┐                   │
-│  │ Board Sync  │  │  Rollover   │                   │
-│  │ (PR events) │  │  (weekly)   │                   │
-│  └─────────────┘  └─────────────┘                   │
-│                                                     │
-│              Claude Code CLI                        │
-└───────────────────────┬─────────────────────────────┘
-                        │
-┌───────────────────────┴─────────────────────────────┐
-│              GitHub Projects V2                     │
-│            (State Management)                       │
-│                                                     │
-│   Board: Todo → In Progress → Ready for QA → Done   │
-│   Milestones: "26 CW 14", "26 CW 15", ...           │
-│   Labels: p0 (critical) through p5 (backlog)        │
-└───────────────────────┬─────────────────────────────┘
-                        │
-┌───────────────────────┴─────────────────────────────┐
-│              Telegram Notifications                 │
-│         (Visibility at every stage)                 │
-└─────────────────────────────────────────────────────┘
+                       +-----------+
+       (issue created) |   Todo    |<-------------------------+
+                       +-----+-----+                          |
+                             |                                |
+           Implementer picks | (priority + milestone filter)  | PR closed
+           top issue, moves  v                                | without merge
+                       +-----------+                          |
+                       |In Progress|                          |
+                       +-----+-----+                          |
+                             |                                |
+                Claude pushes| branch `autoagent/<num>-<slug>`|
+                and opens PR v                                |
+                       +-----------+                          |
+                       |Ready For QA|-------------------------+
+                       +-----+-----+
+                             |
+         All checks pass,    |  (Fixer loops here on failures,
+         no CHANGES_REQUESTED|   no board transitions during fixes)
+         & Claude gate says  v
+         MERGE               |
+                       +-----------+
+                       |   Done    |
+                       +-----------+
 ```
 
-## How It Works
+- **Todo -> In Progress**: `autoagent-implementer.yml` (prepare job) when it picks the issue.
+- **In Progress -> Ready For QA**: `autoagent-board-sync.yml` on `pull_request.opened`, keyed off branch prefix `autoagent/<issue_num>-`.
+- **Ready For QA -> Done**: `autoagent-board-sync.yml` on `pull_request.closed && merged`.
+- **-> Todo (back)**: `autoagent-board-sync.yml` on `pull_request.closed && !merged`.
 
-Three systems in constant gravitational pull, each with its own orbit, producing stable results:
+Column names are case-sensitive string matches in GraphQL responses.
 
-1. **GitHub Actions** runs the autonomous workflows on schedule
-2. **GitHub Projects V2** is the shared state - board columns, milestones, and labels
-3. **Telegram** provides visibility at every stage of the pipeline
+## Risk gate
 
-The entire system is shell scripts and GraphQL queries. No framework, no SDK, no dependencies beyond `gh`, `jq`, and `curl`. Everything is auditable in the GitHub Actions logs and version-controlled alongside the code it operates on.
+The Planner classifies every change-set into one of three risk tiers using the
+rubric defined in `.github/prompts/planner.md`:
 
-## Workflows
+### High risk
 
-### [AUTOAGENT] Implementer
+Triggers: database schema/migrations, authentication/authorization/IAM, public
+API surface changes, infrastructure-as-code (Terraform, Docker, Kubernetes, CI
+pipeline core control flow), new runtime dependencies, credentials/secrets/
+encryption.
 
-**Schedule**: Every hour | **File**: `autoagent-implementer.yml`
+Action: the Planner commits the change-set to `docs/change-sets/<N>.md` on a
+dedicated branch, opens a spec PR for human review, and the pipeline pauses.
+The Implementer is **not** dispatched. A human must review the spec PR, merge it
+to approve the plan, and then manually trigger the Implementer via
+`workflow_dispatch`.
 
-Scans the project board for TODO issues in the current week's milestone, picks the highest-priority one, and hands it to Claude Code CLI for autonomous implementation.
+### Medium risk
 
-**Pipeline**: Scan board → Pick issue (priority + milestone) → Move to In Progress → Create branch → Implement → Test → Open PR → Notify
+Triggers: substantial new business logic, refactor touching more than 3
+call-sites, new first-class module.
 
-Key features:
+Action: the Planner posts the change-set as an issue comment (prefixed with the
+sentinel `<!-- AUTOAGENT_CHANGE_SET -->`), applies the `risk/medium` label, and
+dispatches the Implementer automatically.
 
-- **Priority ranking**: Labels `p0` through `p5`. Sorts by priority first, then by issue body length (better-specified issues = higher success rate)
-- **Milestone filtering**: Only picks issues assigned to the current calendar week
-- **Dependency detection**: If an issue body contains "Depends on: #123", the implementer bases the branch on #123's open PR instead of main
-- **Safety checks**: Skips if anything is already In Progress or another implementer is running
+### Low risk
 
-### [AUTOAGENT] Fixer
+Triggers: bug fixes, docs, tests, copy changes, UI tweaks, internal renames,
+configuration values.
 
-**Schedule**: Every 30 min at :15 and :45 | **Trigger**: CI failure on autoagent branches | **File**: `autoagent-fixer.yml`
+Action: same as medium -- issue comment plus automatic Implementer dispatch,
+with a `risk/low` label.
 
-When CI fails or a reviewer requests changes on an autoagent PR, the fixer gathers all failure context and feeds it to Claude for autonomous fixing.
+Tie-break rules: low vs. medium -> pick medium; medium vs. high -> pick high.
 
-**Handles three failure types**:
-
-1. **CI failures**: Reads failed run logs, finds root cause, fixes the actual bug
-2. **Code review comments**: Addresses each comment, fixes critical/medium issues
-3. **Merge conflicts**: Rebases on base branch, resolves conflicts, pushes with `--force-with-lease`
-
-Key features:
-
-- **Dedup**: Queries active fixer workflow runs to skip PRs already being fixed
-- **Auto-trigger**: Fires on `check_suite` failures for autoagent branches
-- **Safety**: Only touches `autoagent/*` branches, never human PRs
-- **Re-requests reviewers** after pushing fixes
-
-### [AUTOAGENT] Merger
-
-**Schedule**: Every 2 hours | **File**: `autoagent-merger.yml`
-
-Scans for autoagent PRs that are fully green (all checks pass, no changes requested, no conflicts, no unresolved review issues) and merges them sequentially.
-
-Key features:
-
-- **Sequential merging**: Processes PRs one at a time, re-verifying status before each merge
-- **Conflict awareness**: After merging one PR, re-checks the next - if it now has conflicts, skips it (the fixer will handle rebase on its next run)
-- **Claude merge analysis**: Before merging, Claude analyzes review comments, verdicts, and recent commits to determine if CRITICAL/MEDIUM issues were addressed - smarter than keyword matching. These issues can come from GitHub Copilot reviews, Claude Code reviews, or any human reviewer
-- **Fast pre-filter**: Keyword scan in the prepare phase catches obvious blockers before invoking Claude
-- **Fail-open**: If Claude is unavailable, defaults to merge (mechanical checks already passed)
-- **Concurrency group**: Prevents overlapping merger runs
-
-### [AUTOAGENT] Board Sync
-
-**Trigger**: PR events on autoagent branches | **File**: `autoagent-board-sync.yml`
-
-Keeps the project board in sync with PR state:
-
-- **PR opened** → Issue moves to "Ready for QA"
-- **PR merged** → Issue moves to "Done"
-- **PR closed without merge** → Issue moves back to "Todo"
-
-### [AUTO] Week Rollover
-
-**Schedule**: Every Monday at 06:00 UTC | **File**: `auto-week-rollover.yml`
-
-Automates sprint management with two modes:
-
-- **Milestones mode** (default): Creates next week's milestone, moves open issues forward, closes the old milestone
-- **Iterations mode**: Uses GitHub Projects V2 iteration fields instead of milestones
-
-Milestone format: `"YY CW WW"` (e.g., `"26 CW 14"`)
-
-### Telegram Notifications
-
-**Reusable workflow** | **File**: `notify.yml`
-
-Every workflow sends notifications at start and completion. Silence is the worst signal for autonomous agents - you can't tell the difference between "nothing happened" and "everything is broken."
+**Carve-out for this repository:** editing agent prompts under `.github/prompts/`
+or non-critical helper workflows is classified as `medium`, not `high`. Reserve
+`high` for changes to the triggering, permissions, or core control flow of the
+four agent workflows.
 
 ## Setup
 
-### Prerequisites
+### Required secrets
 
-- A GitHub repository with [GitHub Projects V2](https://docs.github.com/en/issues/planning-and-tracking-with-projects)
-- A GitHub runner (self-hosted or GitHub-hosted) with `gh`, `jq`, and `curl`
-- An [Anthropic API key](https://console.anthropic.com/) - Claude Code CLI is installed automatically by the workflows
+Add these to your repository (Settings -> Secrets and variables -> Actions):
 
-### 1. Copy the workflows
+| Secret | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Anthropic API key for Claude Code CLI. |
+| `AGENT_PAT` | Yes | GitHub Personal Access Token with `repo`, `project`, and `workflow` scopes. The default `GITHUB_TOKEN` cannot access org-level Projects V2; a PAT with `project` scope is required. |
+| `TELEGRAM_BOT_TOKEN` | No | Telegram Bot API token (from @BotFather). Only needed if `notifications.provider` is `telegram`. |
+| `TELEGRAM_CHAT_ID` | No | Telegram chat ID for notifications. Only needed if `notifications.provider` is `telegram`. |
+| `SLACK_WEBHOOK_URL` | No | Slack incoming webhook URL. Only needed if `notifications.provider` is `slack`. |
 
-Copy the `.github/workflows/` and `.github/prompts/` directories to your repository. The prompts are standalone markdown files with `${VAR}` placeholders -- edit them to match your project without touching workflow YAML.
+### Required labels
 
-### 2. Configure secrets
+Create these labels on your repository:
 
-Add these secrets to your repository (Settings → Secrets and variables → Actions):
+**Priority labels** (used by the Implementer to rank issues):
 
-| Secret               | Description                                                                                                                                                          |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY`  | Anthropic API key for Claude Code CLI. Add as a repository secret - the workflows inject it automatically.                                                           |
-| `AGENT_PAT`          | GitHub Personal Access Token with `repo`, `project`, and `workflow` scopes. Required for org-level project board access (`GITHUB_TOKEN` cannot access org ProjectV2). |
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot API token (from [@BotFather](https://t.me/BotFather)). Optional - see note below.                                                                       |
-| `TELEGRAM_CHAT_ID`   | Telegram chat ID for notifications. Optional - see note below.                                                                                                       |
+- `p0` -- Critical / blocker
+- `p1` -- High priority
+- `p2` -- Normal priority
+- `p3` -- Medium priority
+- `p4` -- Low priority
+- `p5` -- Backlog
 
-> **Notifications are pluggable.** The template uses Telegram, but any messaging service works - Slack, Discord, email, etc. Just swap the `curl` call in `notify.yml` with your preferred webhook or API. The reusable workflow pattern stays the same.
+**Risk tier labels** (applied by the Planner after classification):
 
-### 3. Configure the workflows
+- `risk/low`
+- `risk/medium`
+- `risk/high`
 
-Search for `TODO` comments across all workflow files. Here's what you need to change:
+**Plan trigger label**:
 
-#### Organization and repository
+- `plan` -- Adding this label to an issue fires the Planner workflow.
 
-In `autoagent-implementer.yml`, `autoagent-board-sync.yml`, and `auto-week-rollover.yml`:
+All label names are configurable in `.github/autoagent-config.yml`.
+
+### Required Projects V2 board
+
+Create a GitHub Projects V2 board with these columns (names must match exactly;
+they are case-sensitive):
+
+- **Todo** -- Issues ready for implementation.
+- **In Progress** -- Currently being worked on by an agent.
+- **Ready For QA** -- PR opened, awaiting review/CI.
+- **Done** -- Merged.
+
+Column names are configurable in `autoagent-config.yml` under `board.columns`.
+
+### Configuration
+
+All project-specific values live in `.github/autoagent-config.yml`. The config
+loader (`.github/scripts/autoagent-config.sh`) parses this file with `yq` and
+exports `AUTOAGENT_*` environment variables. Every agent workflow loads the
+config via the `.github/actions/autoagent-setup` composite action.
+
+The loader validates that all required keys are present and non-null, and
+refuses to run in CI if placeholder values like `your-org` are still in place.
+
+Below is a walkthrough of every top-level key.
+
+#### `github`
 
 ```yaml
-env:
-  PROJECT_ORG: your-org # ← Your GitHub org or username
-  REPO: your-org/your-repo # ← Your org/repo
-  PROJECT_NUMBER: 1 # ← Your GitHub Projects V2 number
+github:
+  organization: "herbae-org"        # org or user that owns the Projects V2 board
+  repository: "herbae-org/foreman"  # full OWNER/NAME
+  project_number: 2                 # Projects V2 board number
 ```
 
-#### Project board columns
-
-In `autoagent-board-sync.yml`, adjust the status names to match your board:
-
-```bash
-# These must match your project board column names exactly:
-# "Todo", "In Progress", "Ready For QA", "Done"
-```
-
-#### Milestone format
-
-In `autoagent-implementer.yml` and `auto-week-rollover.yml`, the default milestone format is `"YY CW WW"` (e.g., `"26 CW 14"`). Adjust if your convention differs, or remove milestone filtering if you don't use milestones.
-
-#### Dependency installation
-
-In `autoagent-implementer.yml` and `autoagent-fixer.yml`, uncomment and adjust the dependency installation step:
+#### `board`
 
 ```yaml
-# - name: Install dependencies
-#   run: npm install
+board:
+  status_field: "Status"            # name of the single-select status field
+  columns:
+    todo: "Todo"
+    in_progress: "In Progress"
+    ready_for_qa: "Ready For QA"
+    done: "Done"
 ```
 
-#### Runner environment
-
-All workflows default to `ubuntu-latest`. If using self-hosted runners, change:
+#### `milestones`
 
 ```yaml
-runs-on: ubuntu-latest # ← Change to [self-hosted, macOS] or your runner labels
+milestones:
+  use_iterations: false             # true to use iteration fields instead of milestones
+  format: "YY CW WW"               # milestone title format (milestones mode only)
+  iteration_field: "Calendar Week"  # iteration field name (iterations mode only)
+  done_status: "Done"               # done column for iteration queries
 ```
 
-#### Merge method
+#### `labels`
 
-In `autoagent-merger.yml`, the default is merge commits:
-
-```bash
-gh pr merge "$PR_NUM" --merge  # Change to --squash or --rebase
+```yaml
+labels:
+  priorities: ["p0", "p1", "p2", "p3", "p4", "p5"]
+  plan: "plan"                      # label that triggers the Planner
+  high_risk: "risk/high"
+  medium_risk: "risk/medium"
+  low_risk: "risk/low"
 ```
 
-### 4. Set up the project board
+#### `branch`
 
-Create a GitHub Projects V2 board with these columns:
-
-- **Todo** - Issues ready for implementation
-- **In Progress** - Currently being worked on
-- **Ready For QA** - PR opened, awaiting review
-- **Done** - Merged
-
-### 5. Set up labels
-
-Create priority labels on your repository:
-
-- `p0` - Critical / blocker
-- `p1` - High priority
-- `p2` - Normal priority
-- `p3` - Medium priority
-- `p4` - Low priority
-- `p5` - Backlog
-
-The implementer sorts by these labels when picking the next issue.
-
-### 6. Set up milestones (optional)
-
-If using milestone-based filtering, create milestones with the format `"YY CW WW"` (e.g., `"26 CW 14"`). The week rollover workflow automates this - run it once manually to bootstrap.
-
-## Writing Good Issues
-
-The number one predictor of autonomous implementation success is the quality of the issue description. Include:
-
-- **Clear acceptance criteria** - what does "done" look like?
-- **Example inputs/outputs** - concrete examples, not abstract descriptions
-- **References to existing code** - "see `src/services/auth.ts` for the pattern"
-- **Dependencies** - "Depends on: #123" if this issue builds on another
-
-## Branch Naming
-
-The pipeline uses the `autoagent/` prefix for all automated branches:
-
-```
-autoagent/123-add-user-authentication
-autoagent/456-fix-date-parsing
+```yaml
+branch:
+  prefix: "autoagent/"              # all agent branches start with this prefix
 ```
 
-The issue number prefix is required - Board Sync uses it to map branches back to issues.
+Board Sync uses this prefix to map branches back to issues.
 
-## Architecture Decisions
+#### `severity_keywords`
 
-**Why shell scripts instead of a framework?** The orchestration is simple enough that shell + `gh` + `jq` covers it. No dependency management, no build step, no abstraction layers. The intelligence comes from the model, not the framework.
+```yaml
+severity_keywords:
+  blocking: ["CRITICAL", "MEDIUM"]  # reviewer comments matching these block the Merger
+```
 
-**Why sequential merging?** Merging PR A can create conflicts in PR B. Sequential merging with re-verification catches this. The fixer handles the rebase on its next cycle.
+#### `agents`
 
-**Why milestone filtering?** Without it, the implementer picks from the entire backlog. Milestones scope work to the current sprint, matching how teams actually plan.
+```yaml
+agents:
+  planner:
+    enabled: true
+    model: "claude-sonnet-4-6"
+    max_turns: 80
+    timeout_minutes: 30
+  implementer:
+    enabled: true
+    model: "claude-opus-4-6"
+    max_turns: 500
+    timeout_minutes: 90
+    test_retry_budget: 3            # max times Claude may re-run failing tests
+  fixer:
+    enabled: true
+    model: "claude-sonnet-4-6"
+    max_turns: 500
+    timeout_minutes: 60
+  merger:
+    enabled: true
+    model: "claude-sonnet-4-6"
+    merge_method: "merge"           # merge | squash | rebase
+    pause_seconds: 10               # delay between sequential merges
+```
 
-**Why `AGENT_PAT` instead of `GITHUB_TOKEN`?** The default `GITHUB_TOKEN` cannot access organization-level GitHub Projects V2. A PAT with `project` scope is required.
+#### `notifications`
 
-**Why not [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action)?** Anthropic's official GitHub Action is excellent for interactive use cases - PR review, `@claude` mentions, issue triage, and scoped automation. However, it's not the right fit for long-running autonomous agents:
+```yaml
+notifications:
+  provider: "none"                  # telegram | slack | none
+  telegram:
+    bot_token_secret: "TELEGRAM_BOT_TOKEN"
+    chat_id_secret: "TELEGRAM_CHAT_ID"
+  slack:
+    webhook_secret: "SLACK_WEBHOOK_URL"
+```
 
-- **Coarse permission model.** The action controls tool access via explicit allowlists (`--allowedTools`). Autonomous agents that need to read files, run tests, install dependencies, and push code would require enumerating every allowed Bash command pattern - fragile and hard to maintain.
-- **Designed for shorter interactions.** The action is optimized for PR review and targeted fixes, not 90-minute sessions with 500 max turns doing full-issue implementation.
-- **Orchestration lives outside Claude.** The pipeline's real complexity - board scanning, priority ranking, milestone filtering, dependency detection, GraphQL mutations, Telegram notifications - is shell logic that runs before and after the Claude step. The action doesn't help with any of that.
-- **Direct CLI gives full control.** Installing Claude Code via `npm install -g @anthropic-ai/claude-code` and calling it directly is simpler, more transparent, and doesn't add an abstraction layer between your workflow and the tool.
+Set `provider` to `telegram` or `slack` to enable notifications. Set it to
+`none` to disable them entirely. The reusable `notify.yml` workflow reads
+this value and dispatches accordingly. Missing secrets for the chosen provider
+degrade to a log line, not a hard failure.
 
-The action is the right choice for interactive `@claude` workflows in PRs and issues. For autonomous agents, the CLI is the right tool.
+#### `runner`
 
-**A note on `--permission-mode`.** Claude Code CLI offers several permission modes for non-interactive use:
+```yaml
+runner:
+  labels: "ubuntu-latest"           # passed verbatim to runs-on:
+```
 
-| Mode                | Behavior                                                                                                                                                                            | Use case                                       |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| `auto`              | Runs a safety classifier that reviews every action, blocking dangerous operations (external code execution, mass deletion, force push, etc.) while allowing normal development work | **Recommended for CI.** Used by this template. |
-| `dontAsk`           | Only runs pre-approved tools from `--allowedTools` / `permissions.allow` rules. Auto-denies everything else                                                                         | Locked-down CI with strict tool control        |
-| `bypassPermissions` | Skips all permission prompts and safety checks                                                                                                                                      | Isolated containers/VMs with no internet only  |
+### Runner requirements
 
-This template uses `auto` mode. It gives the agent full autonomy for normal development tasks (file edits, running tests, git operations) while the classifier blocks genuinely dangerous actions. If the classifier blocks an action repeatedly, the session aborts - a safe failure mode for headless runs.
+The default runner is `ubuntu-latest`. Self-hosted runners work if they have:
 
-If you run on fully isolated, disposable runners (Docker containers, VMs), you can switch to `bypassPermissions` for zero friction. But for shared or persistent runners, `auto` is the right default.
+- `node` and `npm` (for installing Claude Code CLI)
+- `gh` (GitHub CLI)
+- `jq`
+- `git`
+- `curl`
+- `envsubst` (part of `gettext` on most Linux distributions)
+- `yq` (v4.x; used by the config loader)
+- `shellcheck` (only needed by the CI lint gate, not by the agents themselves)
 
-> **Warning:** Using `bypassPermissions` on company projects can be grounds for termination - it disables all safety checks, which may violate your organization's security policies. Always check with your employer before using it.
+## Your first run
 
+1. **Create an issue** from the `Plannable feature` template
+   (`.github/ISSUE_TEMPLATE/plannable-feature.yml`). Fill in the priority,
+   context, desired outcome, and acceptance test fields.
 
-<video src="https://github.com/user-attachments/assets/2aa1bf2d-b856-4339-b230-372007655d21" controls></video>
+2. **Add the `plan` label** (if the template did not already add it). This
+   fires the Planner workflow.
+
+3. **Watch GitHub Actions** -> `[AUTOAGENT] Planner`. The Planner reads the
+   issue, reads the repo, and produces a change-set with a risk classification.
+
+4. **For low/medium risk**: the Planner posts the change-set as an issue
+   comment, labels the issue with the risk tier, removes the `plan` label,
+   and dispatches the Implementer automatically. No human action needed.
+
+5. **For high risk**: the Planner commits the change-set to
+   `docs/change-sets/<N>.md` on a new branch, opens a spec PR, and pauses
+   the pipeline. To proceed:
+   - Review the spec PR.
+   - Merge it to approve the plan.
+   - Manually dispatch the Implementer workflow via `workflow_dispatch`,
+     passing the issue number and base branch.
+
+6. **Watch the Implementer** run. It creates an `autoagent/<N>-<slug>` branch,
+   implements the change, runs tests (retrying up to the configured
+   `test_retry_budget`), and opens a PR with `Closes #<N>`.
+
+7. **If CI fails**, the Fixer picks up the PR on its next cycle (or on the
+   `check_suite` event), gathers failure context, and pushes fixes.
+
+8. **When all checks pass** and no blocking review issues remain, the Merger
+   merges the PR and Board Sync moves the issue to Done.
+
+## Differences from upstream
+
+This repository is forked from
+[leonardocardoso/three-body-agent](https://github.com/LeonardoCardoso/three-body-agent).
+The following changes have been made:
+
+- Added **Planner agent** (`autoagent-planner.yml` + `planner.md`): a
+  risk-classifying spec producer. Low/medium risk posts the change-set as an
+  issue comment and dispatches the Implementer; high risk opens a spec PR and
+  pauses the pipeline for human approval.
+
+- **Change-set is a markdown file with YAML frontmatter**, parsed with `yq`.
+  No fragile stdout trailer.
+
+- Added **`.github/autoagent-config.yml`** + loader
+  (`.github/scripts/autoagent-config.sh`) + **`.github/actions/autoagent-setup`**
+  composite action. All project-specific values (org, repo, board columns,
+  labels, models, timeouts, notification provider) are centralised in a single
+  config file and validated at load time.
+
+- **Pluggable notifications** (`provider: telegram | slack | none` in config).
+  The reusable `notify.yml` workflow dispatches to the configured provider.
+  Missing secrets degrade gracefully instead of failing the pipeline.
+
+- **Explicit test retry budget** in the Implementer prompt
+  (`agents.implementer.test_retry_budget` in config) with a draft-PR fallback
+  when the budget is exhausted.
+
+- **Board-sync now paginates the GraphQL query** (handles boards with more
+  than 100 items).
+
+- **Fixed: scheduled-path Implementer model reads from config** instead of
+  being hardcoded.
+
+- **Fixed: Implementer/Fixer prompts read from the working tree**, not from
+  `origin/main`.
+
+- **Fixed: Implementer's `gh pr create` now has `GH_TOKEN: AGENT_PAT`
+  exposed**, so PRs can trigger downstream workflows.
+
+- **Fixed: `Todo -> In Progress` transition now fires on every trigger path**,
+  not just the scheduled one.
+
+- **Actionlint + shellcheck CI gate** (`test-workflows-lint.yml`) on every
+  workflow change.
 
 ## How This Relates to Claude Managed Agents
 
@@ -294,6 +422,51 @@ Anthropic launched [Claude Managed Agents](https://www.anthropic.com/products/ma
 Think of it this way: Managed Agents is the engine. Three-Body Agent is the self-driving car.
 
 You can run this pipeline on GitHub Actions (as shipped), or adapt the workflow logic to run on Managed Agents infrastructure. The shell scripts, GraphQL queries, and prompt templates are the actual value - they work regardless of where Claude runs.
+
+## Troubleshooting
+
+### `plan` label not matched
+
+The Planner workflow fires on every `issues.labeled` event, then checks whether
+the label name matches `labels.plan` in `.github/autoagent-config.yml` (default:
+`plan`). If your label is named differently (e.g. `Plan`, `autoagent:plan`),
+update the config to match. The comparison is exact and case-sensitive.
+
+### Placeholder values still in config
+
+The config loader (`.github/scripts/autoagent-config.sh`) refuses to run in CI
+if `github.organization` is still set to `your-org` or any `your-*` pattern.
+You will see a loud failure in the Actions log:
+
+```
+autoagent-config: .github.organization is still 'your-org' -- set it in .github/autoagent-config.yml
+```
+
+Replace all placeholder values with your actual org and repo names.
+
+### Missing `AGENT_PAT` scopes
+
+The `AGENT_PAT` token needs three scopes: `repo`, `project`, and `workflow`.
+The most common mistake is omitting `project` -- without it, every GraphQL
+mutation against the Projects V2 board will fail silently or return permission
+errors. If the Implementer picks an issue but never moves it to `In Progress`,
+check the PAT scopes first.
+
+### Board column name mismatch
+
+Column names in `board.columns` must match your Projects V2 board exactly,
+including case. `"Ready for QA"` is not the same as `"Ready For QA"`. The
+GraphQL queries compare option labels as literal strings. If the Implementer
+or Board Sync logs show `option not found`, compare the config values against
+your board's column names character by character.
+
+### Claude API quota exhaustion
+
+If the Claude API returns rate-limit or quota errors, the agent's Claude Code
+CLI session will fail and the workflow step will exit non-zero. Check the
+Actions run log for `429` or `overloaded` errors. The Fixer will not help here
+-- it fixes code failures, not infrastructure failures. Wait for quota to
+replenish or upgrade your Anthropic plan.
 
 ## License
 
