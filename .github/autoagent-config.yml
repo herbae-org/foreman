@@ -5,7 +5,7 @@
 
 github:
   organization: "herbae-org"                     # org or user that owns the Projects V2 board
-  repository: "herbae/three-body-agent-spike"    # full OWNER/NAME
+  repository: "herbae-org/foreman"               # full OWNER/NAME
   project_number: 1                              # Projects V2 board number
 
 board:
