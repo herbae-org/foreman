@@ -306,16 +306,16 @@ jobs:
 
           if [ "$PRE_SHA" = "$POST_SHA" ]; then
             echo "No new commits from fixer. Merging ${BASE} to re-trigger CI."
-            git fetch origin ${BASE}
-            if git merge origin/${BASE} --no-edit 2>/dev/null; then
+            git fetch origin "$BASE"
+            if git merge "origin/$BASE" --no-edit 2>/dev/null; then
               MERGE_SHA=$(git rev-parse HEAD)
-              if [ "$MERGE_SHA" != "$LOCAL_SHA" ]; then
-                git push origin ${BRANCH}
+              if [ "$MERGE_SHA" != "$POST_SHA" ]; then
+                git push origin "$BRANCH"
                 echo "Merged ${BASE} into ${BRANCH} and pushed."
               else
                 echo "Branch already up to date with ${BASE}. Pushing empty commit to re-trigger CI."
                 git commit --allow-empty -m "chore: re-trigger CI for PR #${PR_NUM}"
-                git push origin ${BRANCH}
+                git push origin "$BRANCH"
               fi
             else
               echo "Merge conflict. Skipping re-trigger."

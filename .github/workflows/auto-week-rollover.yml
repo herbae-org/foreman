@@ -269,10 +269,10 @@ jobs:
               }
             ')
 
-            ROLLOVER_ITEMS=$(echo "$ITEMS" | jq --arg cwId "$CURRENT_CW_ID" --arg done "$AUTOAGENT_DONE_STATUS" '[
+            ROLLOVER_ITEMS=$(echo "$ITEMS" | jq --arg cwId "$CURRENT_CW_ID" --arg doneStatus "$AUTOAGENT_DONE_STATUS" '[
               .data.organization.projectV2.items.nodes[]
               | select(.fieldValueByName.iterationId == $cwId)
-              | select(.status.name != $done)
+              | select(.status.name != $doneStatus)
               | select(.content.state == "OPEN")
               | { itemId: .id, number: .content.number, title: .content.title, status: .status.name }
             ]')

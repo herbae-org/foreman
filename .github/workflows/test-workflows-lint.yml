@@ -24,6 +24,12 @@ on:
 
 env:
   ACTIONLINT_VERSION: 1.7.7
+  # Silence shellcheck style/info noise that doesn't indicate real bugs:
+  #   SC2002 — useless cat (stylistic)
+  #   SC2016 — $ inside single quotes (intentional in our `gh api graphql -f query='...$VAR...'` idiom)
+  #   SC2129 — prefer { cmd; cmd; } >> file over individual redirects (stylistic)
+  # Real-bug codes (quoting, undefined vars, keyword parsing, etc.) stay enabled.
+  SHELLCHECK_OPTS: "-e SC2002,SC2016,SC2129"
 
 jobs:
   actionlint:
