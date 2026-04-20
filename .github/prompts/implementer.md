@@ -38,11 +38,24 @@ Execute the plan step by step:
 - Never introduce hardcoded secrets or credentials
 - Validate user input at system boundaries
 
-## Step 4: Test
+## Step 4: Inner test loop (MANDATORY)
 
-- Add or update tests for every behavioral change
-- Run the test suite and fix failures
-- If the repo has coverage thresholds, do not lower them
+You have a **retry budget of ${TEST_RETRY_BUDGET} iterations** to get the test suite green before opening the PR.
+
+For each iteration:
+1. Run the project's test command (infer it from `package.json`, `Makefile`, `pyproject.toml`, `Cargo.toml`, etc. — pick the most local one).
+2. If all tests pass: break out of the loop and proceed to Step 5.
+3. If any test fails:
+   - Read the failure output (not just the summary — actual assertions, stack traces).
+   - Fix the root cause (not the test, unless the test itself is wrong and you can justify it).
+   - Commit the fix with a message like `fix(test): <what you fixed>`.
+   - Decrement the retry counter.
+
+If the retry budget is exhausted and tests still fail:
+- Do NOT abandon the work. Open the PR anyway as a **draft** (`gh pr create --draft`).
+- Begin the PR description with: `⚠️ Tests failing — see run log`.
+- List the failing tests in the description under a `## Failing tests` heading.
+- The Fixer agent will pick up the PR once it's opened. Your job is to hand it off with full context.
 
 ## Step 5: Commit, Push, Open PR
 

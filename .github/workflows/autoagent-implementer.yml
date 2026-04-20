@@ -361,7 +361,8 @@ jobs:
           ISSUE_TITLE=$(jq -r '.title' /tmp/issue.json)
 
           export ISSUE_NUM ISSUE_TITLE ISSUE_BODY BASE
-          envsubst '$ISSUE_NUM $ISSUE_TITLE $ISSUE_BODY $BASE' < .github/prompts/implementer.md | \
+          export TEST_RETRY_BUDGET="$AUTOAGENT_IMPLEMENTER_TEST_RETRY_BUDGET"
+          envsubst '$ISSUE_NUM $ISSUE_TITLE $ISSUE_BODY $BASE $TEST_RETRY_BUDGET' < .github/prompts/implementer.md | \
             claude -p --verbose --output-format stream-json --model "$CLAUDE_MODEL" --max-turns "$AUTOAGENT_IMPLEMENTER_MAX_TURNS" \
               --permission-mode auto
 
