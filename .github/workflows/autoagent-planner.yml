@@ -1,0 +1,265 @@
+name: '[AUTOAGENT] Planner'
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'GitHub issue number to plan'
+        required: true
+        type: string
+      base_branch:
+        description: 'Base branch (default: main)'
+        required: false
+        default: 'main'
+        type: string
+
+concurrency:
+  # Key mixes both event shapes; one of the two expressions will be empty string, which is fine.
+  group: autoagent-planner-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    timeout-minutes: 30
+    outputs:
+      issue_num: ${{ steps.inputs.outputs.issue_num }}
+      risk:      ${{ steps.run.outputs.risk }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AGENT_PAT }}
+          fetch-depth: 0
+
+      - name: Load autoagent config
+        uses: ./.github/actions/autoagent-setup
+
+      # ── Label gate (issues event only) ────────────────────────────────────
+      # Job-level `if:` cannot reference env vars populated by autoagent-setup,
+      # so we enforce the label match here in shell and write skip=true to
+      # GITHUB_OUTPUT. All subsequent steps check `steps.gate.outputs.skip != 'true'`.
+      - name: Gate on plan label
+        id: gate
+        env:
+          LABEL_NAME: ${{ github.event.label.name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "issues" ] && [ "$LABEL_NAME" != "$AUTOAGENT_LABEL_PLAN" ]; then
+            echo "Label '$LABEL_NAME' is not the plan trigger label ('$AUTOAGENT_LABEL_PLAN'). Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Proceeding — event=$EVENT_NAME label=${LABEL_NAME:-<none>}"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Resolve inputs from either event type ─────────────────────────────
+      - name: Resolve inputs
+        id: inputs
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          INPUT_BASE_BRANCH:  ${{ inputs.base_branch }}
+        run: |
+          set -e
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            ISSUE_NUM="$INPUT_ISSUE_NUMBER"
+            BASE="${INPUT_BASE_BRANCH:-main}"
+          else
+            ISSUE_NUM="$EVENT_ISSUE_NUMBER"
+            BASE="main"
+          fi
+
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUM" --json title -q '.title')
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUM" --json body -q '.body // ""')
+
+          echo "issue_num=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE"           >> "$GITHUB_OUTPUT"
+
+          # Use heredoc delimiter for multi-line values (issue title / body may contain
+          # newlines or special chars that would break a plain = assignment).
+          {
+            echo "issue_title<<__PLANNER_EOF__"
+            echo "$ISSUE_TITLE"
+            echo "__PLANNER_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "issue_body<<__PLANNER_EOF__"
+            echo "$ISSUE_BODY"
+            echo "__PLANNER_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved: issue=#${ISSUE_NUM} base=${BASE} title=${ISSUE_TITLE}"
+
+      # ── Install Claude Code ───────────────────────────────────────────────
+      - name: Install Claude Code
+        if: steps.gate.outputs.skip != 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      # ── Run Planner ───────────────────────────────────────────────────────
+      - name: Run Planner
+        id: run
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN:    ${{ secrets.AGENT_PAT }}
+          ISSUE_NUM:   ${{ steps.inputs.outputs.issue_num }}
+          ISSUE_TITLE: ${{ steps.inputs.outputs.issue_title }}
+          ISSUE_BODY:  ${{ steps.inputs.outputs.issue_body }}
+          BASE:        ${{ steps.inputs.outputs.base }}
+        run: |
+          set -e
+
+          # PLAN_LABEL comes from $AUTOAGENT_LABEL_PLAN (set by autoagent-setup),
+          # not from a GitHub expression, so we assign it here.
+          PLAN_LABEL="$AUTOAGENT_LABEL_PLAN"
+          export PLAN_LABEL
+
+          # Render prompt — only substitute the five documented placeholders.
+          envsubst '$PLAN_LABEL $ISSUE_NUM $ISSUE_TITLE $ISSUE_BODY $BASE' \
+            < .github/prompts/planner.md > /tmp/planner-prompt.md
+
+          # Invoke Claude.
+          claude -p \
+            --model "$AUTOAGENT_PLANNER_MODEL" \
+            --max-turns "$AUTOAGENT_PLANNER_MAX_TURNS" \
+            --permission-mode auto \
+            --output-format text \
+            < /tmp/planner-prompt.md
+
+          # Assert change-set was produced.
+          if [ ! -s /tmp/change-set.md ]; then
+            echo "::error::Planner did not produce /tmp/change-set.md (file missing or empty)."
+            exit 1
+          fi
+
+          # Parse risk from YAML frontmatter.
+          RISK=$(yq --front-matter=extract '.risk' /tmp/change-set.md)
+
+          case "$RISK" in
+            low|medium|high) ;;
+            *)
+              echo "::error::Planner produced invalid risk value: '$RISK'. Must be one of: low, medium, high."
+              exit 1
+              ;;
+          esac
+
+          echo "risk=$RISK" >> "$GITHUB_OUTPUT"
+          echo "Planner complete — risk=${RISK}"
+
+      # ── Label issue with risk tier ────────────────────────────────────────
+      - name: Apply risk label
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          ISSUE_NUM: ${{ steps.inputs.outputs.issue_num }}
+          RISK:      ${{ steps.run.outputs.risk }}
+        run: |
+          set -e
+
+          case "$RISK" in
+            low)    RISK_LABEL="$AUTOAGENT_LABEL_LOW_RISK"    ;;
+            medium) RISK_LABEL="$AUTOAGENT_LABEL_MEDIUM_RISK" ;;
+            high)   RISK_LABEL="$AUTOAGENT_LABEL_HIGH_RISK"   ;;
+          esac
+
+          gh issue edit "$ISSUE_NUM" --add-label "$RISK_LABEL"
+          gh issue edit "$ISSUE_NUM" --remove-label "$AUTOAGENT_LABEL_PLAN" || true
+
+          echo "Labels: +${RISK_LABEL} -${AUTOAGENT_LABEL_PLAN}"
+
+      # ── Low / medium risk: post change-set + dispatch Implementer ─────────
+      - name: Dispatch (low/medium risk)
+        if: steps.gate.outputs.skip != 'true' && steps.run.outputs.risk != 'high'
+        env:
+          GH_TOKEN:  ${{ secrets.AGENT_PAT }}
+          ISSUE_NUM: ${{ steps.inputs.outputs.issue_num }}
+          BASE:      ${{ steps.inputs.outputs.base }}
+          RISK:      ${{ steps.run.outputs.risk }}
+        run: |
+          set -e
+
+          # Post change-set as issue comment (marker allows downstream tooling to find it).
+          COMMENT_BODY="$(printf '<!-- AUTOAGENT_CHANGE_SET -->\n**Planner change-set (risk: %s)**\n\n' "$RISK")$(cat /tmp/change-set.md)"
+          gh issue comment "$ISSUE_NUM" --body "$COMMENT_BODY"
+
+          # Dispatch Implementer.
+          gh workflow run autoagent-implementer.yml \
+            -f issue_number="$ISSUE_NUM" \
+            -f base_branch="$BASE" \
+            -f model="$AUTOAGENT_IMPLEMENTER_MODEL"
+
+          echo "Implementer dispatched for #${ISSUE_NUM} (base=${BASE})"
+
+      # ── High risk: commit change-set to plan branch + open spec PR ────────
+      - name: Open spec PR (high risk)
+        if: steps.gate.outputs.skip != 'true' && steps.run.outputs.risk == 'high'
+        env:
+          GH_TOKEN:    ${{ secrets.AGENT_PAT }}
+          ISSUE_NUM:   ${{ steps.inputs.outputs.issue_num }}
+          ISSUE_TITLE: ${{ steps.inputs.outputs.issue_title }}
+          BASE:        ${{ steps.inputs.outputs.base }}
+        run: |
+          set -e
+
+          # Build a URL-safe slug from the issue title.
+          SLUG=$(echo "$ISSUE_TITLE" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-\|-$//g' \
+            | cut -c1-40)
+
+          BRANCH="${AUTOAGENT_BRANCH_PREFIX}plan-${ISSUE_NUM}-${SLUG}"
+
+          # Create and push the plan branch.
+          git checkout -b "$BRANCH"
+          git config user.name  "autoagent-planner"
+          git config user.email "autoagent-planner@users.noreply.github.com"
+
+          mkdir -p docs/change-sets
+          cp /tmp/change-set.md "docs/change-sets/${ISSUE_NUM}.md"
+
+          git add "docs/change-sets/${ISSUE_NUM}.md"
+          git commit -m "spec: change-set for #${ISSUE_NUM} [high-risk]"
+          git push origin "$BRANCH"
+
+          # Open spec PR — pipeline PAUSES here; human must approve and then
+          # manually dispatch autoagent-implementer.yml to continue.
+          gh pr create \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "spec: #${ISSUE_NUM} — ${ISSUE_TITLE} [high-risk]" \
+            --body "$(printf '%s\n\n%s\n\n%s\n\n%s' \
+              "## High-risk change-set for #${ISSUE_NUM}" \
+              "This PR contains the Planner's change-set for a **high-risk** issue. The Implementer has **not** been dispatched." \
+              "**To proceed:** review \`docs/change-sets/${ISSUE_NUM}.md\`, make any corrections, then manually dispatch the Implementer:" \
+              "\`\`\`\ngh workflow run autoagent-implementer.yml -f issue_number=${ISSUE_NUM} -f base_branch=${BASE}\n\`\`\`")"
+
+          echo "Spec PR opened. Pipeline paused for human review of #${ISSUE_NUM}."
+
+  # ── Notify ────────────────────────────────────────────────────────────────
+  # Reusable workflows can only be called at job level (not as steps), so notify
+  # is a separate job that reads outputs from `plan` via needs.*.outputs.
+  notify:
+    needs: plan
+    if: always()
+    uses: ./.github/workflows/notify.yml
+    with:
+      message: "[AUTOAGENT] Planner - #${{ needs.plan.outputs.issue_num }} — risk=${{ needs.plan.outputs.risk || 'error' }}"
+    secrets:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
