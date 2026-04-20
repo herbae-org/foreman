@@ -27,6 +27,9 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+    # Hardcoded: job-level timeout-minutes evaluates at workflow parse time, before
+    # autoagent-setup exports $AUTOAGENT_PLANNER_TIMEOUT to $GITHUB_ENV. Keep this
+    # value in sync with agents.planner.timeout_minutes in autoagent-config.yml.
     timeout-minutes: 30
     outputs:
       issue_num: ${{ steps.inputs.outputs.issue_num }}
@@ -71,7 +74,7 @@ jobs:
           INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
           INPUT_BASE_BRANCH:  ${{ inputs.base_branch }}
         run: |
-          set -e
+          set -eo pipefail
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             ISSUE_NUM="$INPUT_ISSUE_NUMBER"
@@ -120,7 +123,7 @@ jobs:
           ISSUE_BODY:  ${{ steps.inputs.outputs.issue_body }}
           BASE:        ${{ steps.inputs.outputs.base }}
         run: |
-          set -e
+          set -eo pipefail
 
           # PLAN_LABEL comes from $AUTOAGENT_LABEL_PLAN (set by autoagent-setup),
           # not from a GitHub expression, so we assign it here.
@@ -167,7 +170,7 @@ jobs:
           ISSUE_NUM: ${{ steps.inputs.outputs.issue_num }}
           RISK:      ${{ steps.run.outputs.risk }}
         run: |
-          set -e
+          set -eo pipefail
 
           case "$RISK" in
             low)    RISK_LABEL="$AUTOAGENT_LABEL_LOW_RISK"    ;;
@@ -189,7 +192,7 @@ jobs:
           BASE:      ${{ steps.inputs.outputs.base }}
           RISK:      ${{ steps.run.outputs.risk }}
         run: |
-          set -e
+          set -eo pipefail
 
           # Post change-set as issue comment (marker allows downstream tooling to find it).
           COMMENT_BODY="$(printf '<!-- AUTOAGENT_CHANGE_SET -->\n**Planner change-set (risk: %s)**\n\n' "$RISK")$(cat /tmp/change-set.md)"
@@ -212,36 +215,47 @@ jobs:
           ISSUE_TITLE: ${{ steps.inputs.outputs.issue_title }}
           BASE:        ${{ steps.inputs.outputs.base }}
         run: |
-          set -e
+          set -eo pipefail
 
-          # Build a URL-safe slug from the issue title.
-          SLUG=$(echo "$ISSUE_TITLE" \
-            | tr '[:upper:]' '[:lower:]' \
-            | sed 's/[^a-z0-9]/-/g' \
-            | sed 's/-\{2,\}/-/g' \
-            | sed 's/^-\|-$//g' \
-            | cut -c1-40)
+          # Strip newlines from the title once; used in both the slug and the PR title.
+          SAFE_TITLE=$(printf '%s' "$ISSUE_TITLE" | tr -d '\n\r')
+
+          # Build a URL-safe slug from the issue title. LC_ALL=C makes sed's
+          # character classes byte-wise so behaviour is deterministic regardless
+          # of the runner's locale.
+          SLUG=$(printf '%s' "$SAFE_TITLE" \
+            | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+            | LC_ALL=C sed 's/[^a-z0-9]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//' \
+            | cut -c1-40 \
+            | LC_ALL=C sed 's/-\{1,\}$//')
+          # Fallback for titles that slug down to nothing (all punct, all unicode, empty).
+          SLUG="${SLUG:-issue}"
 
           BRANCH="${AUTOAGENT_BRANCH_PREFIX}plan-${ISSUE_NUM}-${SLUG}"
 
-          # Create and push the plan branch.
-          git checkout -b "$BRANCH"
-          git config user.name  "autoagent-planner"
-          git config user.email "autoagent-planner@users.noreply.github.com"
+          # Configure committer identity before branching.
+          git config --local user.name  "autoagent-planner"
+          git config --local user.email "autoagent-planner@users.noreply.github.com"
+
+          # Fetch and branch off the resolved base ref, not whatever HEAD happens
+          # to be. For workflow_dispatch with a non-default base_branch, HEAD may
+          # be on main while the spec belongs on the feature branch.
+          git fetch origin "$BASE"
+          git checkout -b "$BRANCH" "origin/$BASE"
 
           mkdir -p docs/change-sets
           cp /tmp/change-set.md "docs/change-sets/${ISSUE_NUM}.md"
 
           git add "docs/change-sets/${ISSUE_NUM}.md"
           git commit -m "spec: change-set for #${ISSUE_NUM} [high-risk]"
-          git push origin "$BRANCH"
+          git push -u origin "$BRANCH"
 
           # Open spec PR — pipeline PAUSES here; human must approve and then
           # manually dispatch autoagent-implementer.yml to continue.
           gh pr create \
             --base "$BASE" \
             --head "$BRANCH" \
-            --title "spec: #${ISSUE_NUM} — ${ISSUE_TITLE} [high-risk]" \
+            --title "spec: #${ISSUE_NUM} — ${SAFE_TITLE} [high-risk]" \
             --body "$(printf '%s\n\n%s\n\n%s\n\n%s' \
               "## High-risk change-set for #${ISSUE_NUM}" \
               "This PR contains the Planner's change-set for a **high-risk** issue. The Implementer has **not** been dispatched." \
@@ -255,7 +269,10 @@ jobs:
   # is a separate job that reads outputs from `plan` via needs.*.outputs.
   notify:
     needs: plan
-    if: always()
+    # Skip notification when the plan job was gated out (non-plan label). The
+    # plan job's issue_num output is empty in that case, which doubles as a
+    # signal that no real work happened.
+    if: always() && needs.plan.outputs.issue_num != ''
     uses: ./.github/workflows/notify.yml
     with:
       message: "[AUTOAGENT] Planner - #${{ needs.plan.outputs.issue_num }} — risk=${{ needs.plan.outputs.risk || 'error' }}"

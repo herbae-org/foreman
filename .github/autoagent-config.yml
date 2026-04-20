@@ -43,7 +43,7 @@ agents:
     enabled: true
     model: "claude-sonnet-4-6"
     max_turns: 80
-    timeout_minutes: 20
+    timeout_minutes: 30                # kept in sync with the hardcoded job-level timeout-minutes in autoagent-planner.yml (parse-time YAML can't read $GITHUB_ENV)
   implementer:
     enabled: true
     model: "claude-opus-4-6"
