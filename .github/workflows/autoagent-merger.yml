@@ -46,7 +46,7 @@ jobs:
           # high-risk human gate.
           PRS=$(gh pr list --repo "${{ github.repository }}" --state open \
             --json number,headRefName,mergeable,title \
-            --jq ".[] | select(.headRefName | startswith(\"${AUTOAGENT_BRANCH_PREFIX}\") and (.headRefName | startswith(\"${AUTOAGENT_BRANCH_PREFIX}plan-\") | not))" 2>/dev/null || echo "")
+            --jq ".[] | select((.headRefName | startswith(\"${AUTOAGENT_BRANCH_PREFIX}\")) and ((.headRefName | startswith(\"${AUTOAGENT_BRANCH_PREFIX}plan-\")) | not))" 2>/dev/null || echo "")
 
           if [ -z "$PRS" ]; then
             echo "No open autoagent PRs found."
